@@ -25,24 +25,17 @@ function parseTtl(input: string): number {
 async function readSecret(prompt: string): Promise<string> {
   const input = process.stdin;
   const output = process.stdout;
-  const rl = readline.createInterface({ input, output });
+  const rl = readline.createInterface({ input, output: undefined });
   const originalWrite = output.write.bind(output);
-  output.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: (error?: Error | null) => void) => {
-    const text = chunk.toString();
-    if (text.includes(prompt) || text === "\n" || text === "\r\n") {
-      return originalWrite(chunk, encoding, callback);
-    }
-    return originalWrite("*".repeat([...text].length), encoding, callback);
-  }) as typeof output.write;
 
   try {
+    output.write(prompt);
     return await new Promise<string>((resolve) => {
-      rl.question(prompt, (answer) => resolve(answer));
+      rl.question("", (answer) => resolve(answer));
     });
   } finally {
-    output.write = originalWrite;
     rl.close();
-    output.write("\n");
+    originalWrite("\n");
   }
 }
 
