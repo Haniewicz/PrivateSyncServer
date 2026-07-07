@@ -167,6 +167,8 @@ npm run syncctl -- password reset
 npm run syncctl -- password reset --password "nowe-haslo"
 npm run syncctl -- password verify
 npm run syncctl -- password verify --password "nowe-haslo"
+npm run syncctl -- password http-verify --url "https://twoj-serwer.example"
+npm run syncctl -- password http-verify --url "https://twoj-serwer.example" --password "nowe-haslo"
 npm run syncctl -- pairing-code create --ttl=10m
 npm run syncctl -- initial-setup enable
 ```
@@ -180,6 +182,14 @@ PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config sho
 PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password verify
 PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password reset
 ```
+
+Jeśli `password verify` działa, ale plugin nadal dostaje `invalid_password`, sprawdź ten sam publiczny URL, który wpisujesz w pluginie:
+
+```bash
+PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password http-verify --url "https://twoj-serwer.example"
+```
+
+Jeśli `http-verify` nie działa, plugin trafia w inną instancję, zły reverse proxy albo inny URL niż baza sprawdzona przez `password verify`.
 
 Po `password reset` restart serwera nie jest wymagany, bo hash hasła jest czytany z bazy przy każdym logowaniu.
 

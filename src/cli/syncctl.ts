@@ -22,6 +22,10 @@ function parseTtl(input: string): number {
   return value * (unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000);
 }
 
+function apiUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/$/, "")}${path}`;
+}
+
 async function readSecret(prompt: string): Promise<string> {
   const input = process.stdin;
   const output = process.stdout;
@@ -60,6 +64,20 @@ try {
       process.exit(2);
     }
     console.log(`Password matches database: ${config.databasePath}`);
+  } else if (command === "password" && subcommand === "http-verify") {
+    const url = valueOf("--url", `http://${config.host}:${config.port}`);
+    const password = valueOf("--password") ?? (await readSecret("Server password: "));
+    const response = await fetch(apiUrl(url!, "/api/v1/auth/login"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password })
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      console.error(`HTTP password verification failed at ${url}: ${response.status} ${text}`);
+      process.exit(2);
+    }
+    console.log(`HTTP password verification succeeded at ${url}: ${text}`);
   } else if (command === "config" && subcommand === "show") {
     console.log(JSON.stringify({
       dataDir: config.dataDir,
@@ -83,6 +101,8 @@ try {
   syncctl password reset --password <password>
   syncctl password verify
   syncctl password verify --password <password>
+  syncctl password http-verify --url <server-url>
+  syncctl password http-verify --url <server-url> --password <password>
   syncctl pairing-code create --ttl=10m
   syncctl initial-setup enable
   syncctl initial-setup disable`);
