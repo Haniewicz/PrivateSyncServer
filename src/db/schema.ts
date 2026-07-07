@@ -96,6 +96,31 @@ export function migrate(db: Database.Database): void {
       FOREIGN KEY(batch_id) REFERENCES sync_batches(id)
     );
 
+    CREATE TABLE IF NOT EXISTS staged_chunk_uploads (
+      id TEXT PRIMARY KEY,
+      batch_id TEXT NOT NULL,
+      client_change_id TEXT NOT NULL,
+      expected_hash TEXT NOT NULL,
+      expected_size INTEGER NOT NULL,
+      chunk_size INTEGER NOT NULL,
+      total_chunks INTEGER NOT NULL,
+      received_chunks INTEGER NOT NULL DEFAULT 0,
+      temp_dir TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(batch_id) REFERENCES sync_batches(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS staged_chunk_parts (
+      upload_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      size INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(upload_id, chunk_index),
+      FOREIGN KEY(upload_id) REFERENCES staged_chunk_uploads(id)
+    );
+
     CREATE TABLE IF NOT EXISTS accepted_client_changes (
       device_id TEXT NOT NULL,
       client_change_id TEXT NOT NULL,

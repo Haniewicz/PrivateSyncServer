@@ -1,4 +1,7 @@
 import type { FastifyInstance } from "fastify";
+import fs from "node:fs";
+import path from "node:path";
+import { nanoid } from "nanoid";
 import { z } from "zod";
 import { db } from "../db/database.js";
 import { config } from "../config.js";
@@ -144,6 +147,86 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     return { ok: true, contentHash: stored.hash, size: stored.size };
   });
 
+  fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload", async (request, reply) => {
+    const params = z.object({ batchId: z.string() }).parse(request.params);
+    const body = z
+      .object({
+        clientChangeId: z.string().min(1),
+        contentHash: z.string().min(1),
+        size: z.number().int().nonnegative(),
+        chunkSize: z.number().int().positive(),
+        totalChunks: z.number().int().positive()
+      })
+      .parse(request.body);
+    const uploadId = nanoid();
+    const tempDir = path.join(config.dataDir, "staging", params.batchId, uploadId);
+    fs.mkdirSync(tempDir, { recursive: true });
+    db.prepare(
+      `INSERT INTO staged_chunk_uploads
+        (id, batch_id, client_change_id, expected_hash, expected_size, chunk_size, total_chunks, temp_dir, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(uploadId, params.batchId, body.clientChangeId, body.contentHash, body.size, body.chunkSize, body.totalChunks, tempDir, new Date().toISOString(), new Date().toISOString());
+    return reply.code(201).send({ uploadId });
+  });
+
+  fastify.put("/api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload/:uploadId/chunks/:chunkIndex", async (request) => {
+    const params = z.object({ uploadId: z.string(), chunkIndex: z.coerce.number().int().nonnegative() }).parse(request.params);
+    const upload = db.prepare("SELECT * FROM staged_chunk_uploads WHERE id = ?").get(params.uploadId) as
+      | { id: string; total_chunks: number; temp_dir: string }
+      | undefined;
+    if (!upload) throw new Error("Chunked upload not found.");
+    if (params.chunkIndex >= upload.total_chunks) throw new Error("Chunk index out of range.");
+
+    const content = Buffer.isBuffer(request.body) ? request.body : Buffer.from(request.body as ArrayBuffer);
+    const contentHash = sha256(content);
+    const chunkPath = path.join(upload.temp_dir, `${params.chunkIndex}.part`);
+    fs.writeFileSync(chunkPath, content);
+    const inserted = db
+      .prepare("INSERT OR IGNORE INTO staged_chunk_parts (upload_id, chunk_index, size, content_hash, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(upload.id, params.chunkIndex, content.byteLength, contentHash, new Date().toISOString());
+    if (inserted.changes > 0) {
+      db.prepare("UPDATE staged_chunk_uploads SET received_chunks = received_chunks + 1, updated_at = ? WHERE id = ?").run(new Date().toISOString(), upload.id);
+    } else {
+      db.prepare("UPDATE staged_chunk_parts SET size = ?, content_hash = ?, created_at = ? WHERE upload_id = ? AND chunk_index = ?").run(
+        content.byteLength,
+        contentHash,
+        new Date().toISOString(),
+        upload.id,
+        params.chunkIndex
+      );
+    }
+    return { ok: true, chunkHash: contentHash };
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload/:uploadId/finish", async (request) => {
+    const params = z.object({ batchId: z.string(), uploadId: z.string() }).parse(request.params);
+    const upload = db.prepare("SELECT * FROM staged_chunk_uploads WHERE id = ? AND batch_id = ?").get(params.uploadId, params.batchId) as
+      | {
+          id: string;
+          batch_id: string;
+          client_change_id: string;
+          expected_hash: string;
+          expected_size: number;
+          total_chunks: number;
+          received_chunks: number;
+          temp_dir: string;
+        }
+      | undefined;
+    if (!upload) throw new Error("Chunked upload not found.");
+    if (upload.received_chunks !== upload.total_chunks) throw new Error("Chunked upload is incomplete.");
+
+    const chunkPaths = Array.from({ length: upload.total_chunks }, (_, index) => path.join(upload.temp_dir, `${index}.part`));
+    for (const chunkPath of chunkPaths) {
+      if (!fs.existsSync(chunkPath)) throw new Error("Chunked upload is missing a part.");
+    }
+    const stored = blobs.putFromChunkFiles(chunkPaths);
+    if (stored.hash !== upload.expected_hash) throw new Error("Chunked upload content hash mismatch.");
+    if (stored.size !== upload.expected_size) throw new Error("Chunked upload size mismatch.");
+    sync.stageBlob(params.batchId, upload.client_change_id, stored.hash, stored.relativePath, stored.size);
+    fs.rmSync(upload.temp_dir, { recursive: true, force: true });
+    return { ok: true, contentHash: stored.hash, size: stored.size };
+  });
+
   fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/commit", async (request) => {
     const params = z.object({ vaultId: z.string(), batchId: z.string() }).parse(request.params);
     return sync.commitBatch(params.vaultId, params.batchId, request.device!.id);
@@ -162,7 +245,22 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       .get(params.vaultId, query.path) as { blob_path: string; content_hash: string; size: number } | undefined;
     if (!revision) return reply.code(404).send({ error: "file_not_found" });
     reply.header("x-content-hash", revision.content_hash);
-    return reply.send(blobs.get(revision.blob_path));
+    reply.header("accept-ranges", "bytes");
+    const range = request.headers.range;
+    const filePath = blobs.getPath(revision.blob_path);
+    if (range) {
+      const match = range.match(/^bytes=(\d+)-(\d+)?$/);
+      if (!match) return reply.code(416).send({ error: "invalid_range" });
+      const start = Number(match[1]);
+      const end = Math.min(match[2] ? Number(match[2]) : revision.size - 1, revision.size - 1);
+      if (start > end || start >= revision.size) return reply.code(416).send({ error: "range_not_satisfiable" });
+      reply.code(206);
+      reply.header("content-range", `bytes ${start}-${end}/${revision.size}`);
+      reply.header("content-length", end - start + 1);
+      return reply.send(fs.createReadStream(filePath, { start, end }));
+    }
+    reply.header("content-length", revision.size);
+    return reply.send(fs.createReadStream(filePath));
   });
 
   fastify.get("/api/v1/vaults/:vaultId/files/history", async (request) => {

@@ -23,6 +23,9 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 - `GET /api/v1/vaults/:vaultId/changes?since=0`
 - `POST /api/v1/vaults/:vaultId/sync-batches`
 - `POST /api/v1/vaults/:vaultId/sync-batches/:batchId/upload`
+- `POST /api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload`
+- `PUT /api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload/:uploadId/chunks/:chunkIndex`
+- `POST /api/v1/vaults/:vaultId/sync-batches/:batchId/chunked-upload/:uploadId/finish`
 - `POST /api/v1/vaults/:vaultId/sync-batches/:batchId/commit`
 - `GET /api/v1/vaults/:vaultId/files/download?path=note.md`
 - `GET /api/v1/vaults/:vaultId/files/history?path=note.md`
@@ -50,6 +53,8 @@ Ten backend jest prywatnym serwerem synchronizacji vaultów Obsidiana. Nie rende
   - prosi serwer o commit batcha,
   - serwer waliduje batch i dopiero wtedy publikuje nową globalną rewizję vaulta.
 - Jeśli batch jest przerwany w połowie, niedokończone pliki stagingowe nie stają się aktualnym stanem vaulta.
+- Duże uploady mogą być wysyłane w chunkach. Serwer zapisuje części w `data/staging`, składa finalny blob na dysku i weryfikuje hash oraz rozmiar przed oznaczeniem pliku jako staged.
+- Download pliku obsługuje nagłówek `Range`, więc klient może pobierać duże pliki fragmentami.
 - Serwer wykrywa konflikty przez porównanie `base_revision_id` z aktualną rewizją pliku na serwerze.
 - Serwer wykrywa potencjalnie niebezpieczne operacje, np. masowe usuwanie, i zatrzymuje batch do decyzji użytkownika.
 
@@ -59,6 +64,7 @@ Najważniejsze źródła obciążenia:
 
 - upload i download plików,
 - zapis/odczyt blobów z dysku,
+- zapis/odczyt części uploadu w `data/staging` dla dużych plików,
 - obliczanie SHA-256 uploadowanych treści,
 - transakcje SQLite podczas commitowania batchy,
 - liczba jednocześnie podłączonych urządzeń WebSocket,

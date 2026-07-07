@@ -10,6 +10,9 @@ import { AuthService } from "./services/auth.js";
 import { eventHub } from "./services/events.js";
 
 const fastify = Fastify({ logger: true, bodyLimit: config.maxUploadSize });
+fastify.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => {
+  done(null, body);
+});
 await fastify.register(cors);
 await fastify.register(multipart, { limits: { fileSize: config.maxUploadSize } });
 await registerAuth(fastify);
