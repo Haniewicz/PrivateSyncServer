@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import { config } from "../config.js";
 import { db } from "../db/database.js";
 import { AuthService } from "../services/auth.js";
 
@@ -53,10 +54,27 @@ try {
     if (!password) throw new Error("Usage: syncctl setup --password <password>");
     auth.setup(password);
     console.log("Server configured. Initial setup is enabled for the first trusted device.");
+    console.log(`Database: ${config.databasePath}`);
   } else if (command === "password" && subcommand === "reset") {
     const password = valueOf("--password") ?? (await readSecret("New server password: "));
     auth.resetPassword(password);
     console.log("Server password reset.");
+    console.log(`Database: ${config.databasePath}`);
+  } else if (command === "password" && subcommand === "verify") {
+    const password = valueOf("--password") ?? (await readSecret("Server password: "));
+    if (!auth.verifyPassword(password)) {
+      console.error(`Password does not match database: ${config.databasePath}`);
+      process.exit(2);
+    }
+    console.log(`Password matches database: ${config.databasePath}`);
+  } else if (command === "config" && subcommand === "show") {
+    console.log(JSON.stringify({
+      dataDir: config.dataDir,
+      databasePath: config.databasePath,
+      blobDir: config.blobDir,
+      host: config.host,
+      port: config.port
+    }, null, 2));
   } else if (command === "pairing-code" && subcommand === "create") {
     const ttl = parseTtl(valueOf("--ttl", "10m")!);
     const code = auth.createRecoveryPairingCode(ttl);
@@ -67,8 +85,11 @@ try {
   } else {
     console.log(`Usage:
   syncctl setup --password <password>
+  syncctl config show
   syncctl password reset
   syncctl password reset --password <password>
+  syncctl password verify
+  syncctl password verify --password <password>
   syncctl pairing-code create --ttl=10m
   syncctl initial-setup enable
   syncctl initial-setup disable`);

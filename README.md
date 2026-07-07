@@ -162,12 +162,25 @@ Dla większego użycia warto rozważyć:
 
 ```bash
 npm run syncctl -- setup --password "zmien-to-haslo"
+npm run syncctl -- config show
 npm run syncctl -- password reset
 npm run syncctl -- password reset --password "nowe-haslo"
+npm run syncctl -- password verify
+npm run syncctl -- password verify --password "nowe-haslo"
 npm run syncctl -- pairing-code create --ttl=10m
 npm run syncctl -- initial-setup enable
 ```
 
 `password reset` zmienia główne hasło logowania do serwera. Nie unieważnia istniejących `device_token` i nie odzyskuje ani nie zmienia kluczy szyfrowania danych, jeśli szyfrowanie E2E zostanie dodane później.
+
+Jeśli po resecie plugin nadal zwraca `invalid_password`, najpierw sprawdź, czy resetujesz tę samą bazę SQLite, której używa uruchomiony serwer. `syncctl` używa zmiennych `PRIVATE_SYNC_DATA_DIR` i `DATABASE_PATH` tak samo jak serwer, więc przy instalacji systemd trzeba uruchamiać komendy z tym samym env:
+
+```bash
+PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config show
+PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password verify
+PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password reset
+```
+
+Po `password reset` restart serwera nie jest wymagany, bo hash hasła jest czytany z bazy przy każdym logowaniu.
 
 To jest baza pod dalszy rozwój: staging batchy, globalne rewizje, historia plików, device tokeny, requesty decyzyjne i konflikty są już modelowane w bazie.
