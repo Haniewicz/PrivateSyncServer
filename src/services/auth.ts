@@ -40,6 +40,10 @@ export class AuthService {
     return Boolean(user && bcrypt.compareSync(password, user.password_hash));
   }
 
+  isConfigured(): boolean {
+    return Boolean(this.db.prepare("SELECT id FROM users LIMIT 1").get());
+  }
+
   isInitialSetupEnabled(): boolean {
     const setting = this.db.prepare("SELECT value FROM server_settings WHERE key = 'initial_setup'").get() as { value: string } | undefined;
     return setting?.value === "true";

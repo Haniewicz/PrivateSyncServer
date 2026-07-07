@@ -50,12 +50,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
   fastify.post("/api/v1/auth/login", async (request, reply) => {
     const body = z.object({ password: z.string().min(1) }).parse(request.body);
+    if (!auth.isConfigured()) return reply.code(409).send({ error: "server_not_configured" });
     if (!auth.verifyPassword(body.password)) return reply.code(401).send({ error: "invalid_password" });
     return { ok: true, initialSetup: auth.isInitialSetupEnabled() };
   });
 
   fastify.post("/api/v1/devices/request", async (request, reply) => {
     const body = deviceRequestSchema.extend({ recoveryPairingCode: z.string().optional() }).parse(request.body);
+    if (!auth.isConfigured()) return reply.code(409).send({ error: "server_not_configured" });
     if (!auth.verifyPassword(body.password)) return reply.code(401).send({ error: "invalid_password" });
 
     if (auth.isInitialSetupEnabled() || (body.recoveryPairingCode && auth.consumeRecoveryPairingCode(body.recoveryPairingCode))) {
