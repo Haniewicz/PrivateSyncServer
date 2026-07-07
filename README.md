@@ -191,6 +191,15 @@ PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password h
 
 Jeśli `http-verify` nie działa, plugin trafia w inną instancję, zły reverse proxy albo inny URL niż baza sprawdzona przez `password verify`.
 
+Porównaj też `instanceId` z:
+
+```bash
+npm run syncctl -- config show
+curl https://twoj-serwer.example/api/v1/server-info
+```
+
+Jeśli `instanceId` jest różny, CLI i publiczny URL korzystają z różnych baz/instancji.
+
 Po `password reset` restart serwera nie jest wymagany, bo hash hasła jest czytany z bazy przy każdym logowaniu.
 
 To jest baza pod dalszy rozwój: staging batchy, globalne rewizje, historia plików, device tokeny, requesty decyzyjne i konflikty są już modelowane w bazie.

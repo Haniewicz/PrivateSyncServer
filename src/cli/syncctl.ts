@@ -67,6 +67,9 @@ try {
   } else if (command === "password" && subcommand === "http-verify") {
     const url = valueOf("--url", `http://${config.host}:${config.port}`);
     const password = valueOf("--password") ?? (await readSecret("Server password: "));
+    const infoResponse = await fetch(apiUrl(url!, "/api/v1/server-info"));
+    const infoText = await infoResponse.text();
+    console.log(`HTTP server-info at ${url}: ${infoResponse.status} ${infoText}`);
     const response = await fetch(apiUrl(url!, "/api/v1/auth/login"), {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -83,6 +86,7 @@ try {
       dataDir: config.dataDir,
       databasePath: config.databasePath,
       blobDir: config.blobDir,
+      instanceId: auth.getInstanceId(),
       host: config.host,
       port: config.port
     }, null, 2));

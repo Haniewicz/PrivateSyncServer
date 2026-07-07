@@ -55,6 +55,14 @@ export class AuthService {
     return Boolean(this.db.prepare("SELECT id FROM users LIMIT 1").get());
   }
 
+  getInstanceId(): string {
+    const existing = this.db.prepare("SELECT value FROM server_settings WHERE key = 'instance_id'").get() as { value: string } | undefined;
+    if (existing) return existing.value;
+    const instanceId = nanoid();
+    this.db.prepare("INSERT INTO server_settings (key, value) VALUES ('instance_id', ?)").run(instanceId);
+    return instanceId;
+  }
+
   isInitialSetupEnabled(): boolean {
     const setting = this.db.prepare("SELECT value FROM server_settings WHERE key = 'initial_setup'").get() as { value: string } | undefined;
     return setting?.value === "true";

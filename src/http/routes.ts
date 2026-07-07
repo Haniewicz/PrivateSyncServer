@@ -42,6 +42,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get("/api/v1/server-info", async (request) => ({
     protocolVersion: config.protocolVersion,
     serverVersion: config.serverVersion,
+    instanceId: auth.getInstanceId(),
     features: ["device_tokens", "sync_batches", "vault_revision", "conflicts", "decision_requests", "blob_storage"],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
