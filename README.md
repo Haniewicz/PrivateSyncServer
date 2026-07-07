@@ -162,8 +162,12 @@ Dla większego użycia warto rozważyć:
 
 ```bash
 npm run syncctl -- setup --password "zmien-to-haslo"
+npm run syncctl -- password reset
+npm run syncctl -- password reset --password "nowe-haslo"
 npm run syncctl -- pairing-code create --ttl=10m
 npm run syncctl -- initial-setup enable
 ```
+
+`password reset` zmienia główne hasło logowania do serwera. Nie unieważnia istniejących `device_token` i nie odzyskuje ani nie zmienia kluczy szyfrowania danych, jeśli szyfrowanie E2E zostanie dodane później.
 
 To jest baza pod dalszy rozwój: staging batchy, globalne rewizje, historia plików, device tokeny, requesty decyzyjne i konflikty są już modelowane w bazie.

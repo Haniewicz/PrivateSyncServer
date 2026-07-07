@@ -25,6 +25,7 @@ export class AuthService {
   }
 
   setup(password: string): void {
+    this.validatePassword(password);
     const existing = this.db.prepare("SELECT id FROM users LIMIT 1").get();
     if (existing) {
       throw new Error("Server is already configured.");
@@ -33,6 +34,16 @@ export class AuthService {
     this.db.prepare("INSERT INTO users (id, password_hash, created_at) VALUES (?, ?, ?)").run("user", passwordHash, this.now());
     this.db.prepare("INSERT OR REPLACE INTO server_settings (key, value) VALUES ('initial_setup', 'true')").run();
     this.ensureDefaultVault();
+  }
+
+  resetPassword(password: string): void {
+    this.validatePassword(password);
+    const existing = this.db.prepare("SELECT id FROM users LIMIT 1").get() as { id: string } | undefined;
+    if (!existing) {
+      throw new Error("Server is not configured. Run setup first.");
+    }
+    const passwordHash = bcrypt.hashSync(password, 12);
+    this.db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, existing.id);
   }
 
   verifyPassword(password: string): boolean {
@@ -87,5 +98,11 @@ export class AuthService {
     if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) return false;
     this.db.prepare("UPDATE recovery_pairing_codes SET used_at = ? WHERE id = ?").run(this.now(), row.id);
     return true;
+  }
+
+  private validatePassword(password: string): void {
+    if (password.trim().length < 8) {
+      throw new Error("Password must have at least 8 characters.");
+    }
   }
 }
