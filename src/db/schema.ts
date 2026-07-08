@@ -156,6 +156,18 @@ export function migrate(db: Database.Database): void {
       resolved_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS vault_connections (
+      vault_id TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      local_vault_instance_id TEXT NOT NULL,
+      last_synced_at TEXT NOT NULL,
+      last_seen_revision INTEGER NOT NULL,
+      last_manifest_hash TEXT NOT NULL,
+      PRIMARY KEY(vault_id, device_id, local_vault_instance_id),
+      FOREIGN KEY(vault_id) REFERENCES vaults(id),
+      FOREIGN KEY(device_id) REFERENCES devices(id)
+    );
+
     CREATE TABLE IF NOT EXISTS request_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       request_id TEXT NOT NULL,

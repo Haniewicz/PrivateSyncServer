@@ -45,6 +45,18 @@ const vaultCreateSchema = z.object({
   id: vaultIdSchema.optional(),
   name: z.string().trim().min(1).max(120)
 });
+const localVaultInstanceIdSchema = z.string().trim().min(8).max(120);
+const manifestHashSchema = z.string().trim().regex(/^[a-f0-9]{64}$/i);
+const connectionAssessmentSchema = z.object({
+  localVaultInstanceId: localVaultInstanceIdSchema,
+  localFileCount: z.number().int().nonnegative(),
+  localManifestHash: manifestHashSchema
+});
+const syncStateSchema = z.object({
+  localVaultInstanceId: localVaultInstanceIdSchema,
+  localFileCount: z.number().int().nonnegative(),
+  localManifestHash: manifestHashSchema
+});
 
 export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   auth.ensureDefaultVault();
@@ -53,7 +65,16 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     protocolVersion: config.protocolVersion,
     serverVersion: config.serverVersion,
     instanceId: auth.getInstanceId(),
-    features: ["device_tokens", "sync_batches", "vault_revision", "conflicts", "decision_requests", "blob_storage", "multiple_vaults"],
+    features: [
+      "device_tokens",
+      "sync_batches",
+      "vault_revision",
+      "conflicts",
+      "decision_requests",
+      "blob_storage",
+      "multiple_vaults",
+      "vault_connection_safety"
+    ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
     websocketUrl: websocketUrl(proxyHost(request.headers["x-forwarded-host"]) ?? request.headers.host ?? `${config.host}:${config.port}`, request.headers["x-forwarded-proto"])
@@ -192,6 +213,56 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     if (existing) return reply.code(409).send({ error: "vault_already_exists" });
     db.prepare("INSERT INTO vaults (id, name, current_revision, created_at) VALUES (?, ?, 0, ?)").run(id, body.name, new Date().toISOString());
     return reply.code(201).send({ id, name: body.name, currentRevision: 0 });
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/connection-assessment", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    const body = connectionAssessmentSchema.parse(request.body);
+    const vault = db.prepare("SELECT current_revision AS currentRevision FROM vaults WHERE id = ?").get(params.vaultId) as
+      | { currentRevision: number }
+      | undefined;
+    if (!vault) return reply.code(404).send({ error: "vault_not_found" });
+
+    const remoteManifest = getVaultManifest(params.vaultId);
+    const previousConnection = getVaultConnection(params.vaultId, request.device!.id, body.localVaultInstanceId);
+    const assessment = assessConnection({
+      localManifestHash: body.localManifestHash.toLowerCase(),
+      localFileCount: body.localFileCount,
+      remoteRevision: vault.currentRevision,
+      remoteManifest,
+      previousConnection
+    });
+
+    return {
+      remoteFileCount: remoteManifest.fileCount,
+      remoteRevision: vault.currentRevision,
+      remoteManifestHash: remoteManifest.manifestHash,
+      previousConnection,
+      riskLevel: assessment.riskLevel,
+      reasons: assessment.reasons
+    };
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/sync-state", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    const body = syncStateSchema.parse(request.body);
+    const vault = db.prepare("SELECT current_revision AS currentRevision FROM vaults WHERE id = ?").get(params.vaultId) as
+      | { currentRevision: number }
+      | undefined;
+    if (!vault) return reply.code(404).send({ error: "vault_not_found" });
+    db
+      .prepare(
+        `INSERT INTO vault_connections
+          (vault_id, device_id, local_vault_instance_id, last_synced_at, last_seen_revision, last_manifest_hash)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(vault_id, device_id, local_vault_instance_id)
+         DO UPDATE SET
+           last_synced_at = excluded.last_synced_at,
+           last_seen_revision = excluded.last_seen_revision,
+           last_manifest_hash = excluded.last_manifest_hash`
+      )
+      .run(params.vaultId, request.device!.id, body.localVaultInstanceId, new Date().toISOString(), vault.currentRevision, body.localManifestHash.toLowerCase());
+    return { ok: true, revision: vault.currentRevision };
   });
 
   fastify.get("/api/v1/vaults/:vaultId/changes", async (request) => {
@@ -516,4 +587,87 @@ function vaultIdFromName(name: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 60);
   return vaultIdSchema.safeParse(slug).success ? slug : `vault-${nanoid(8)}`;
+}
+
+type VaultManifest = {
+  fileCount: number;
+  manifestHash: string;
+};
+
+type VaultConnection = {
+  localVaultInstanceId: string;
+  lastSyncedAt: string;
+  lastSeenRevision: number;
+  lastManifestHash: string;
+} | null;
+
+type RiskLevel = "empty" | "high" | "medium" | "very_low";
+
+function getVaultManifest(vaultId: string): VaultManifest {
+  const rows = db
+    .prepare(
+      `SELECT f.path, fr.content_hash AS contentHash, fr.size
+         FROM files f
+         JOIN file_revisions fr ON fr.id = f.current_file_revision_id
+        WHERE f.vault_id = ? AND f.deleted = 0
+        ORDER BY f.path ASC`
+    )
+    .all(vaultId) as Array<{ path: string; contentHash: string | null; size: number }>;
+  return {
+    fileCount: rows.length,
+    manifestHash: sha256(rows.map((row) => `${row.path}\0${row.contentHash ?? ""}\0${row.size}`).join("\n"))
+  };
+}
+
+function getVaultConnection(vaultId: string, deviceId: string, localVaultInstanceId: string): VaultConnection {
+  const row = db
+    .prepare(
+      `SELECT local_vault_instance_id AS localVaultInstanceId,
+              last_synced_at AS lastSyncedAt,
+              last_seen_revision AS lastSeenRevision,
+              last_manifest_hash AS lastManifestHash
+         FROM vault_connections
+        WHERE vault_id = ? AND device_id = ? AND local_vault_instance_id = ?`
+    )
+    .get(vaultId, deviceId, localVaultInstanceId) as VaultConnection | undefined;
+  return row ?? null;
+}
+
+function assessConnection(input: {
+  localManifestHash: string;
+  localFileCount: number;
+  remoteRevision: number;
+  remoteManifest: VaultManifest;
+  previousConnection: VaultConnection;
+}): { riskLevel: RiskLevel; reasons: string[] } {
+  if (input.remoteManifest.fileCount === 0) {
+    return { riskLevel: "empty", reasons: ["Remote vault is empty."] };
+  }
+  const reasons: string[] = [];
+  if (input.localManifestHash === input.remoteManifest.manifestHash) {
+    reasons.push("Local and remote manifests match.");
+    return { riskLevel: "high", reasons };
+  }
+  if (input.previousConnection) {
+    const lastSyncMs = Date.parse(input.previousConnection.lastSyncedAt);
+    const fresh = Number.isFinite(lastSyncMs) && Date.now() - lastSyncMs <= 24 * 60 * 60 * 1000;
+    if (fresh && input.previousConnection.lastSeenRevision === input.remoteRevision) {
+      reasons.push("This local vault synced with this remote vault in the last 24 hours at the current remote revision.");
+      return { riskLevel: "high", reasons };
+    }
+    reasons.push(
+      fresh
+        ? "This local vault synced with this remote vault recently, but the remote revision changed."
+        : "This local vault synced with this remote vault before, but not in the last 24 hours."
+    );
+    reasons.push(`Local files: ${input.localFileCount}; remote files: ${input.remoteManifest.fileCount}.`);
+    return { riskLevel: "medium", reasons };
+  }
+  return {
+    riskLevel: "very_low",
+    reasons: [
+      "No previous connection was found for this local vault and remote vault.",
+      `Local files: ${input.localFileCount}; remote files: ${input.remoteManifest.fileCount}.`
+    ]
+  };
 }
