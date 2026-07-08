@@ -20,6 +20,7 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 - `POST /api/v1/devices/approve`
 - `POST /api/v1/devices/revoke`
 - `GET /api/v1/vaults`
+- `POST /api/v1/vaults`
 - `GET /api/v1/vaults/:vaultId/changes?since=0`
 - `POST /api/v1/vaults/:vaultId/sync-batches`
 - `POST /api/v1/vaults/:vaultId/sync-batches/:batchId/upload`
@@ -33,6 +34,8 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 - `POST /api/v1/vaults/:vaultId/requests/:requestId/resolve`
 
 WebSocket działa pod `/api/v1/events?token=DEVICE_TOKEN` i służy tylko do eventów.
+
+Serwer obsługuje wiele vaultów. Setup tworzy domyślny vault `default`, a kolejne można utworzyć przez `POST /api/v1/vaults` z poziomu sparowanego klienta.
 
 ## Jak działa backend i jak oszacować VPS
 

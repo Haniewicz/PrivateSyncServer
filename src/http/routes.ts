@@ -35,6 +35,16 @@ const operationSchema = z.object({
   encrypted: z.boolean().optional(),
   encryptedFileKey: z.string().nullable().optional()
 });
+const vaultIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+const vaultCreateSchema = z.object({
+  id: vaultIdSchema.optional(),
+  name: z.string().trim().min(1).max(120)
+});
 
 export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   auth.ensureDefaultVault();
@@ -43,7 +53,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     protocolVersion: config.protocolVersion,
     serverVersion: config.serverVersion,
     instanceId: auth.getInstanceId(),
-    features: ["device_tokens", "sync_batches", "vault_revision", "conflicts", "decision_requests", "blob_storage"],
+    features: ["device_tokens", "sync_batches", "vault_revision", "conflicts", "decision_requests", "blob_storage", "multiple_vaults"],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
     websocketUrl: websocketUrl(proxyHost(request.headers["x-forwarded-host"]) ?? request.headers.host ?? `${config.host}:${config.port}`, request.headers["x-forwarded-proto"])
@@ -174,6 +184,15 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get("/api/v1/vaults", async () => ({
     vaults: db.prepare("SELECT id, name, current_revision AS currentRevision, created_at AS createdAt FROM vaults").all()
   }));
+
+  fastify.post("/api/v1/vaults", async (request, reply) => {
+    const body = vaultCreateSchema.parse(request.body);
+    const id = body.id ?? vaultIdFromName(body.name);
+    const existing = db.prepare("SELECT id FROM vaults WHERE id = ?").get(id);
+    if (existing) return reply.code(409).send({ error: "vault_already_exists" });
+    db.prepare("INSERT INTO vaults (id, name, current_revision, created_at) VALUES (?, ?, 0, ?)").run(id, body.name, new Date().toISOString());
+    return reply.code(201).send({ id, name: body.name, currentRevision: 0 });
+  });
 
   fastify.get("/api/v1/vaults/:vaultId/changes", async (request) => {
     const params = z.object({ vaultId: z.string() }).parse(request.params);
@@ -487,4 +506,14 @@ function parseApprovedDeviceDecision(decisionJson: string | null): { deviceId: s
   } catch {
     return null;
   }
+}
+
+function vaultIdFromName(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return vaultIdSchema.safeParse(slug).success ? slug : `vault-${nanoid(8)}`;
 }
