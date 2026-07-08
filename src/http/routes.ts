@@ -78,6 +78,23 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     return reply.code(202).send({ status: "pending", requestId });
   });
 
+  fastify.post("/api/v1/devices/request/:requestId/status", async (request, reply) => {
+    const params = z.object({ requestId: z.string() }).parse(request.params);
+    const body = z.object({ password: z.string().min(1) }).parse(request.body);
+    if (!auth.isConfigured()) return reply.code(409).send({ error: "server_not_configured" });
+    if (!auth.verifyPassword(body.password)) return reply.code(401).send({ error: "invalid_password" });
+
+    const pairing = db
+      .prepare("SELECT id, status, decision_json AS decisionJson FROM requests WHERE id = ? AND type = 'device_pairing'")
+      .get(params.requestId) as { id: string; status: string; decisionJson: string | null } | undefined;
+    if (!pairing) return reply.code(404).send({ error: "pairing_request_not_found" });
+    if (pairing.status !== "approved") return { status: pairing.status };
+
+    const decision = parseApprovedDeviceDecision(pairing.decisionJson);
+    if (!decision) return reply.code(409).send({ error: "approved_device_token_not_available" });
+    return { status: "approved", deviceId: decision.deviceId, deviceToken: decision.deviceToken };
+  });
+
   fastify.post("/api/v1/devices/approve", async (request, reply) => {
     const body = z.object({ requestId: z.string(), deviceName: z.string(), deviceType }).parse(request.body);
     const pairing = db.prepare("SELECT id, status FROM requests WHERE id = ? AND type = 'device_pairing'").get(body.requestId) as
@@ -85,7 +102,10 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       | undefined;
     if (!pairing || pairing.status !== "pending") return reply.code(404).send({ error: "pending_request_not_found" });
     const device = auth.createTrustedDevice(body.deviceName, body.deviceType);
-    requests.resolve(body.requestId, request.device?.id ?? null, "approved", { approvedDeviceId: device.deviceId });
+    requests.resolve(body.requestId, request.device?.id ?? null, "approved", {
+      approvedDeviceId: device.deviceId,
+      deviceToken: device.deviceToken
+    });
     return { status: "approved", ...device };
   });
 
@@ -303,4 +323,15 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 function websocketUrl(host: string): string {
   const scheme = host.startsWith("127.") || host.startsWith("localhost") ? "ws" : "wss";
   return `${scheme}://${host}/api/v1/events`;
+}
+
+function parseApprovedDeviceDecision(decisionJson: string | null): { deviceId: string; deviceToken: string } | null {
+  if (!decisionJson) return null;
+  try {
+    const decision = JSON.parse(decisionJson) as { approvedDeviceId?: unknown; deviceToken?: unknown };
+    if (typeof decision.approvedDeviceId !== "string" || typeof decision.deviceToken !== "string") return null;
+    return { deviceId: decision.approvedDeviceId, deviceToken: decision.deviceToken };
+  } catch {
+    return null;
+  }
 }
