@@ -50,7 +50,12 @@ export class SyncService {
     this.db.prepare("UPDATE sync_batches SET status = 'uploading', updated_at = ? WHERE id = ?").run(this.now(), batchId);
   }
 
-  commitBatch(vaultId: string, batchId: string, deviceId: string): { status: string; revision?: number; requestId?: string; conflicts?: string[] } {
+  commitBatch(
+    vaultId: string,
+    batchId: string,
+    deviceId: string,
+    options: { skipDangerousOperationCheck?: boolean } = {}
+  ): { status: string; revision?: number; requestId?: string; conflicts?: string[] } {
     const tx = this.db.transaction(() => {
       const batch = this.db.prepare("SELECT * FROM sync_batches WHERE id = ? AND vault_id = ?").get(batchId, vaultId) as BatchRow | undefined;
       if (!batch) throw new Error("Batch not found.");
@@ -59,8 +64,10 @@ export class SyncService {
 
       this.db.prepare("UPDATE sync_batches SET status = 'validating', updated_at = ? WHERE id = ?").run(this.now(), batchId);
       const operations = JSON.parse(batch.operations_json) as SyncOperation[];
-      const dangerousRequest = this.detectDangerousOperations(vaultId, batchId, deviceId, operations);
-      if (dangerousRequest) return dangerousRequest;
+      if (!options.skipDangerousOperationCheck) {
+        const dangerousRequest = this.detectDangerousOperations(vaultId, batchId, deviceId, operations);
+        if (dangerousRequest) return dangerousRequest;
+      }
 
       const conflicts: string[] = [];
       for (const operation of operations) {

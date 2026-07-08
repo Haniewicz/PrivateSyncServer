@@ -7,6 +7,8 @@ export type ServerEvent =
   | { type: "conflict_created"; conflict_id: string; vault_id: string; path: string }
   | { type: "conflict_resolved"; conflict_id: string; vault_id: string; status: string }
   | { type: "device_revoked"; device_id: string }
+  | { type: "device_restored"; device_id: string }
+  | { type: "device_deleted"; device_id: string }
   | { type: "server_status"; status: string };
 
 export class EventHub {

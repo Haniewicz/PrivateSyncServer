@@ -116,6 +116,22 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
+  fastify.post("/api/v1/devices/restore", async (request, reply) => {
+    const body = z.object({ deviceId: z.string() }).parse(request.body);
+    const result = db.prepare("UPDATE devices SET revoked_at = NULL WHERE id = ?").run(body.deviceId);
+    if (result.changes === 0) return reply.code(404).send({ error: "device_not_found" });
+    eventHub.broadcast({ type: "device_restored", device_id: body.deviceId });
+    return { ok: true };
+  });
+
+  fastify.post("/api/v1/devices/delete", async (request, reply) => {
+    const body = z.object({ deviceId: z.string() }).parse(request.body);
+    if (body.deviceId === request.device?.id) return reply.code(400).send({ error: "cannot_delete_current_device" });
+    db.prepare("DELETE FROM devices WHERE id = ?").run(body.deviceId);
+    eventHub.broadcast({ type: "device_deleted", device_id: body.deviceId });
+    return { ok: true };
+  });
+
   fastify.get("/api/v1/devices", async () => {
     return {
       devices: db
@@ -334,6 +350,22 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     };
   });
 
+  fastify.get("/api/v1/vaults/:vaultId/files/revisions/:revisionId/download", async (request, reply) => {
+    const params = z.object({ vaultId: z.string(), revisionId: z.coerce.number().int().positive() }).parse(request.params);
+    const revision = getFileRevision(params.vaultId, params.revisionId);
+    if (!revision || revision.deleted || !revision.blob_path) return reply.code(404).send({ error: "revision_not_downloadable" });
+    reply.header("x-content-hash", revision.content_hash ?? "");
+    reply.header("content-length", revision.size);
+    return reply.send(fs.createReadStream(blobs.getPath(revision.blob_path)));
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/files/revisions/:revisionId/restore", async (request, reply) => {
+    const params = z.object({ vaultId: z.string(), revisionId: z.coerce.number().int().positive() }).parse(request.params);
+    const restored = restoreRevision(params.vaultId, params.revisionId, request.device!.id);
+    if (!restored) return reply.code(404).send({ error: "revision_not_found" });
+    return restored;
+  });
+
   fastify.get("/api/v1/vaults/:vaultId/requests", async (request) => {
     const params = z.object({ vaultId: z.string() }).parse(request.params);
     return {
@@ -343,10 +375,24 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     };
   });
 
-  fastify.post("/api/v1/vaults/:vaultId/requests/:requestId/resolve", async (request) => {
-    const params = z.object({ requestId: z.string() }).parse(request.params);
+  fastify.post("/api/v1/vaults/:vaultId/requests/:requestId/resolve", async (request, reply) => {
+    const params = z.object({ vaultId: z.string(), requestId: z.string() }).parse(request.params);
     const body = z.object({ status: z.enum(["approved", "rejected", "resolved"]), decision: z.unknown().optional() }).parse(request.body);
+    const pending = db.prepare("SELECT * FROM requests WHERE id = ? AND (vault_id = ? OR vault_id IS NULL) AND status = 'pending'").get(
+      params.requestId,
+      params.vaultId
+    ) as { id: string; type: string; created_by_device_id: string | null; payload_json: string } | undefined;
+    if (!pending) return reply.code(404).send({ error: "pending_request_not_found" });
     requests.resolve(params.requestId, request.device!.id, body.status, body.decision ?? {});
+    if (body.status === "approved" && (pending.type === "mass_delete_approval" || pending.type === "suspicious_operation")) {
+      const payload = JSON.parse(pending.payload_json) as { batchId?: unknown };
+      if (typeof payload.batchId === "string" && pending.created_by_device_id) {
+        const result = sync.commitBatch(params.vaultId, payload.batchId, pending.created_by_device_id, {
+          skipDangerousOperationCheck: true
+        });
+        return { ok: true, batch: result };
+      }
+    }
     return { ok: true };
   });
 }
@@ -354,6 +400,77 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 function websocketUrl(host: string): string {
   const scheme = host.startsWith("127.") || host.startsWith("localhost") ? "ws" : "wss";
   return `${scheme}://${host}/api/v1/events`;
+}
+
+function getFileRevision(vaultId: string, revisionId: number):
+  | {
+      id: number;
+      file_id: string;
+      path: string;
+      vault_id: string;
+      content_hash: string | null;
+      blob_path: string | null;
+      size: number;
+      deleted: number;
+    }
+  | undefined {
+  return db
+    .prepare(
+      `SELECT fr.id, fr.file_id, f.path, fr.vault_id, fr.content_hash, fr.blob_path, fr.size, fr.deleted
+         FROM file_revisions fr
+         JOIN files f ON f.id = fr.file_id
+        WHERE fr.vault_id = ? AND fr.id = ?`
+    )
+    .get(vaultId, revisionId) as
+    | {
+        id: number;
+        file_id: string;
+        path: string;
+        vault_id: string;
+        content_hash: string | null;
+        blob_path: string | null;
+        size: number;
+        deleted: number;
+      }
+    | undefined;
+}
+
+function restoreRevision(vaultId: string, revisionId: number, deviceId: string): { ok: true; revision: number; path: string } | null {
+  const tx = db.transaction(() => {
+    const revision = getFileRevision(vaultId, revisionId);
+    if (!revision) return null;
+    const vault = db.prepare("SELECT current_revision FROM vaults WHERE id = ?").get(vaultId) as { current_revision: number } | undefined;
+    if (!vault) return null;
+    const vaultRevision = vault.current_revision + 1;
+    const inserted = db
+      .prepare(
+        `INSERT INTO file_revisions
+          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)`
+      )
+      .run(
+        revision.file_id,
+        vaultId,
+        vaultRevision,
+        revision.content_hash,
+        revision.blob_path,
+        revision.size,
+        deviceId,
+        revision.deleted ? 1 : 0,
+        new Date().toISOString()
+      );
+    db.prepare("UPDATE files SET current_file_revision_id = ?, current_vault_revision = ?, deleted = ?, updated_at = ? WHERE id = ?").run(
+      Number(inserted.lastInsertRowid),
+      vaultRevision,
+      revision.deleted ? 1 : 0,
+      new Date().toISOString(),
+      revision.file_id
+    );
+    db.prepare("UPDATE vaults SET current_revision = ? WHERE id = ?").run(vaultRevision, vaultId);
+    eventHub.broadcast({ type: "vault_changed", vault_id: vaultId, latest_revision: vaultRevision });
+    return { ok: true as const, revision: vaultRevision, path: revision.path };
+  });
+  return tx();
 }
 
 function parseApprovedDeviceDecision(decisionJson: string | null): { deviceId: string; deviceToken: string } | null {
