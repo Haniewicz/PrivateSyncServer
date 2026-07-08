@@ -46,7 +46,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     features: ["device_tokens", "sync_batches", "vault_revision", "conflicts", "decision_requests", "blob_storage"],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
-    websocketUrl: websocketUrl(request.headers.host ?? `${config.host}:${config.port}`)
+    websocketUrl: websocketUrl(proxyHost(request.headers["x-forwarded-host"]) ?? request.headers.host ?? `${config.host}:${config.port}`, request.headers["x-forwarded-proto"])
   }));
 
   fastify.post("/api/v1/auth/login", async (request, reply) => {
@@ -397,9 +397,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   });
 }
 
-function websocketUrl(host: string): string {
-  const scheme = host.startsWith("127.") || host.startsWith("localhost") ? "ws" : "wss";
+function websocketUrl(host: string, forwardedProto: string | string[] | undefined): string {
+  const proto = Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto;
+  const scheme = proto === "https" ? "wss" : host.startsWith("127.") || host.startsWith("localhost") ? "ws" : "wss";
   return `${scheme}://${host}/api/v1/events`;
+}
+
+function proxyHost(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
 }
 
 function getFileRevision(vaultId: string, revisionId: number):

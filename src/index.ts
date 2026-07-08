@@ -6,15 +6,17 @@ import { config } from "./config.js";
 import { db } from "./db/database.js";
 import { registerAuth } from "./http/authPlugin.js";
 import { registerRoutes } from "./http/routes.js";
+import { registerRateLimit } from "./rateLimit.js";
 import { AuthService } from "./services/auth.js";
 import { eventHub } from "./services/events.js";
 
-const fastify = Fastify({ logger: true, bodyLimit: config.maxUploadSize });
+const fastify = Fastify({ logger: true, bodyLimit: config.maxUploadSize, trustProxy: config.trustProxy });
 fastify.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_request, body, done) => {
   done(null, body);
 });
 await fastify.register(cors);
 await fastify.register(multipart, { limits: { fileSize: config.maxUploadSize } });
+await registerRateLimit(fastify);
 await registerAuth(fastify);
 await registerRoutes(fastify);
 
