@@ -135,7 +135,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       changes: db
         .prepare(
           `SELECT fr.id AS fileRevisionId, fr.vault_revision AS vaultRevision, f.path, fr.content_hash AS contentHash,
-                  fr.size, fr.deleted, fr.encrypted, fr.created_at AS createdAt
+                  fr.size, fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
              FROM file_revisions fr
              JOIN files f ON f.id = fr.file_id
             WHERE fr.vault_id = ? AND fr.vault_revision > ?
