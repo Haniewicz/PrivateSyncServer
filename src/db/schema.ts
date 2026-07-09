@@ -23,6 +23,7 @@ export function migrate(db: Database.Database): void {
       token_hash TEXT NOT NULL UNIQUE,
       trusted INTEGER NOT NULL DEFAULT 0,
       revoked_at TEXT,
+      deleted_at TEXT,
       last_seen_at TEXT,
       created_at TEXT NOT NULL
     );
@@ -178,4 +179,9 @@ export function migrate(db: Database.Database): void {
       FOREIGN KEY(request_id) REFERENCES requests(id)
     );
   `);
+
+  const deviceColumns = db.prepare("PRAGMA table_info(devices)").all() as { name: string }[];
+  if (!deviceColumns.some((column) => column.name === "deleted_at")) {
+    db.prepare("ALTER TABLE devices ADD COLUMN deleted_at TEXT").run();
+  }
 }

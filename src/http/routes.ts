@@ -24,6 +24,9 @@ const deviceRequestSchema = z.object({
   deviceName: z.string().min(1),
   deviceType
 });
+const deviceNameUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(120)
+});
 const operationSchema = z.object({
   clientChangeId: z.string().min(1),
   type: z.enum(["create", "update", "delete", "rename", "move"]),
@@ -142,31 +145,63 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
   fastify.post("/api/v1/devices/revoke", async (request) => {
     const body = z.object({ deviceId: z.string() }).parse(request.body);
-    db.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?").run(new Date().toISOString(), body.deviceId);
+    db.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND deleted_at IS NULL").run(new Date().toISOString(), body.deviceId);
     eventHub.broadcast({ type: "device_revoked", device_id: body.deviceId });
     return { ok: true };
   });
 
   fastify.post("/api/v1/devices/restore", async (request, reply) => {
     const body = z.object({ deviceId: z.string() }).parse(request.body);
-    const result = db.prepare("UPDATE devices SET revoked_at = NULL WHERE id = ?").run(body.deviceId);
+    const result = db.prepare("UPDATE devices SET revoked_at = NULL WHERE id = ? AND deleted_at IS NULL").run(body.deviceId);
     if (result.changes === 0) return reply.code(404).send({ error: "device_not_found" });
     eventHub.broadcast({ type: "device_restored", device_id: body.deviceId });
     return { ok: true };
   });
 
+  fastify.post("/api/v1/devices/me", async (request, reply) => {
+    const body = deviceNameUpdateSchema.parse(request.body);
+    const result = db.prepare("UPDATE devices SET name = ? WHERE id = ? AND deleted_at IS NULL").run(body.name, request.device!.id);
+    if (result.changes === 0) return reply.code(404).send({ error: "device_not_found" });
+    const device = db
+      .prepare("SELECT id, name, type, trusted, revoked_at, last_seen_at, created_at FROM devices WHERE id = ? AND deleted_at IS NULL")
+      .get(request.device!.id);
+    eventHub.broadcast({ type: "device_updated", device_id: request.device!.id, name: body.name });
+    return { ok: true, device };
+  });
+
   fastify.post("/api/v1/devices/delete", async (request, reply) => {
     const body = z.object({ deviceId: z.string() }).parse(request.body);
     if (body.deviceId === request.device?.id) return reply.code(400).send({ error: "cannot_delete_current_device" });
-    db.prepare("DELETE FROM devices WHERE id = ?").run(body.deviceId);
+    const device = db.prepare("SELECT id FROM devices WHERE id = ? AND deleted_at IS NULL").get(body.deviceId);
+    if (!device) return reply.code(404).send({ error: "device_not_found" });
+    const now = new Date().toISOString();
+    const decisionJson = JSON.stringify({ reason: "device_deleted", deviceId: body.deviceId });
+    const cleanup = db.transaction(() => {
+      const cancelledConflicts = db
+        .prepare("SELECT id, vault_id AS vaultId FROM conflicts WHERE device_id = ? AND status = 'pending'")
+        .all(body.deviceId) as { id: string; vaultId: string }[];
+      db
+        .prepare("UPDATE conflicts SET status = 'cancelled', decision_json = ?, resolved_at = ? WHERE device_id = ? AND status = 'pending'")
+        .run(decisionJson, now, body.deviceId);
+      db
+        .prepare(
+          "UPDATE sync_batches SET status = 'failed', failure_reason = 'device_deleted', updated_at = ? WHERE device_id = ? AND status = 'waiting_for_decision'"
+        )
+        .run(now, body.deviceId);
+      db.prepare("UPDATE devices SET deleted_at = ?, revoked_at = COALESCE(revoked_at, ?) WHERE id = ?").run(now, now, body.deviceId);
+      return { cancelledConflicts };
+    })();
+    for (const conflict of cleanup.cancelledConflicts) {
+      eventHub.broadcast({ type: "conflict_resolved", conflict_id: conflict.id, vault_id: conflict.vaultId, status: "cancelled" });
+    }
     eventHub.broadcast({ type: "device_deleted", device_id: body.deviceId });
-    return { ok: true };
+    return { ok: true, cancelledConflicts: cleanup.cancelledConflicts.length };
   });
 
   fastify.get("/api/v1/devices", async () => {
     return {
       devices: db
-        .prepare("SELECT id, name, type, trusted, revoked_at, last_seen_at, created_at FROM devices ORDER BY created_at DESC")
+        .prepare("SELECT id, name, type, trusted, revoked_at, last_seen_at, created_at FROM devices WHERE deleted_at IS NULL ORDER BY created_at DESC")
         .all()
     };
   });

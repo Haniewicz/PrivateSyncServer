@@ -8,6 +8,7 @@ export type ServerEvent =
   | { type: "conflict_resolved"; conflict_id: string; vault_id: string; status: string }
   | { type: "device_revoked"; device_id: string }
   | { type: "device_restored"; device_id: string }
+  | { type: "device_updated"; device_id: string; name: string }
   | { type: "device_deleted"; device_id: string }
   | { type: "server_status"; status: string };
 

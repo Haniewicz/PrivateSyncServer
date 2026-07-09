@@ -84,7 +84,7 @@ export class AuthService {
 
   authenticateDevice(token: string): AuthenticatedDevice | null {
     const device = this.db
-      .prepare("SELECT id, name, type FROM devices WHERE token_hash = ? AND trusted = 1 AND revoked_at IS NULL")
+      .prepare("SELECT id, name, type FROM devices WHERE token_hash = ? AND trusted = 1 AND revoked_at IS NULL AND deleted_at IS NULL")
       .get(tokenHash(token)) as AuthenticatedDevice | undefined;
     if (!device) return null;
     this.db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(this.now(), device.id);
