@@ -601,6 +601,7 @@ function deleteVault(vaultId: string): void {
       db.prepare("DELETE FROM staged_blobs WHERE batch_id = ?").run(batch.id);
     }
     db.prepare("DELETE FROM conflicts WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM request_log WHERE request_id IN (SELECT id FROM requests WHERE vault_id = ?)").run(vaultId);
     db.prepare("DELETE FROM requests WHERE vault_id = ?").run(vaultId);
     db.prepare("DELETE FROM vault_connections WHERE vault_id = ?").run(vaultId);
     db.prepare("DELETE FROM file_revisions WHERE vault_id = ?").run(vaultId);
