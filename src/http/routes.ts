@@ -9,6 +9,7 @@ import { BlobStore } from "../storage/blobStore.js";
 import { AuthService } from "../services/auth.js";
 import { RequestService } from "../services/requests.js";
 import { SyncService } from "../services/sync.js";
+import { cleanupBatchStaging, cleanupStorage, getStorageUsage } from "../services/storageUsage.js";
 import { sha256 } from "../lib/crypto.js";
 import type { SyncOperation } from "../domain/types.js";
 import { eventHub } from "../services/events.js";
@@ -76,7 +77,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       "decision_requests",
       "blob_storage",
       "multiple_vaults",
-      "vault_connection_safety"
+      "vault_connection_safety",
+      "storage_usage"
     ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
@@ -300,6 +302,13 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     return { ok: true, revision: vault.currentRevision };
   });
 
+  fastify.get("/api/v1/storage/usage", async () => getStorageUsage(db));
+
+  fastify.post("/api/v1/storage/cleanup", async (request) => {
+    const body = z.object({ targets: z.array(z.enum(["stale_staging", "npm_cache"])).min(1) }).parse(request.body);
+    return cleanupStorage(db, body.targets);
+  });
+
   fastify.get("/api/v1/vaults/:vaultId/changes", async (request) => {
     const params = z.object({ vaultId: z.string() }).parse(request.params);
     const query = z.object({ since: z.coerce.number().int().nonnegative().default(0) }).parse(request.query);
@@ -424,7 +433,9 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
   fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/commit", async (request) => {
     const params = z.object({ vaultId: z.string(), batchId: z.string() }).parse(request.params);
-    return sync.commitBatch(params.vaultId, params.batchId, request.device!.id);
+    const result = sync.commitBatch(params.vaultId, params.batchId, request.device!.id);
+    if (result.status === "committed") cleanupBatchStaging(params.batchId);
+    return result;
   });
 
   fastify.get("/api/v1/vaults/:vaultId/files/download", async (request, reply) => {
@@ -515,6 +526,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
         const result = sync.commitBatch(params.vaultId, payload.batchId, pending.created_by_device_id, {
           skipDangerousOperationCheck: true
         });
+        if (result.status === "committed") cleanupBatchStaging(payload.batchId);
         return { ok: true, batch: result };
       }
     }
