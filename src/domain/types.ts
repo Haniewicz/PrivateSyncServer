@@ -33,4 +33,6 @@ export type SyncOperation = {
   size?: number;
   encrypted?: boolean;
   encryptedFileKey?: string | null;
+  plaintextHash?: string | null;
+  plaintextSize?: number | null;
 };

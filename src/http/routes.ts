@@ -37,7 +37,9 @@ const operationSchema = z.object({
   contentHash: z.string().optional(),
   size: z.number().int().nonnegative().optional(),
   encrypted: z.boolean().optional(),
-  encryptedFileKey: z.string().nullable().optional()
+  encryptedFileKey: z.string().nullable().optional(),
+  plaintextHash: z.string().nullable().optional(),
+  plaintextSize: z.number().int().nonnegative().nullable().optional()
 });
 const vaultIdSchema = z
   .string()
@@ -82,7 +84,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       "multiple_vaults",
       "vault_connection_safety",
       "storage_usage",
-      "vault_management"
+      "vault_management",
+      "client_side_encryption_metadata"
     ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
@@ -354,7 +357,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       changes: db
         .prepare(
           `SELECT fr.id AS fileRevisionId, fr.vault_revision AS vaultRevision, f.path, fr.content_hash AS contentHash,
-                  fr.size, fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
+                  fr.size, fr.plaintext_hash AS plaintextHash, fr.plaintext_size AS plaintextSize,
+                  fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
              FROM file_revisions fr
              JOIN files f ON f.id = fr.file_id
             WHERE fr.vault_id = ? AND fr.vault_revision > ?
@@ -514,6 +518,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       history: db
         .prepare(
           `SELECT fr.id, fr.vault_revision AS vaultRevision, fr.content_hash AS contentHash, fr.size,
+                  fr.plaintext_hash AS plaintextHash, fr.plaintext_size AS plaintextSize,
                   fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
              FROM files f
              JOIN file_revisions fr ON fr.file_id = f.id
@@ -632,11 +637,16 @@ function getFileRevision(vaultId: string, revisionId: number):
       blob_path: string | null;
       size: number;
       deleted: number;
+      encrypted: number;
+      encrypted_file_key: string | null;
+      plaintext_hash: string | null;
+      plaintext_size: number | null;
     }
   | undefined {
   return db
     .prepare(
-      `SELECT fr.id, fr.file_id, f.path, fr.vault_id, fr.content_hash, fr.blob_path, fr.size, fr.deleted
+      `SELECT fr.id, fr.file_id, f.path, fr.vault_id, fr.content_hash, fr.blob_path, fr.size, fr.deleted,
+              fr.encrypted, fr.encrypted_file_key, fr.plaintext_hash, fr.plaintext_size
          FROM file_revisions fr
          JOIN files f ON f.id = fr.file_id
         WHERE fr.vault_id = ? AND fr.id = ?`
@@ -651,6 +661,10 @@ function getFileRevision(vaultId: string, revisionId: number):
         blob_path: string | null;
         size: number;
         deleted: number;
+        encrypted: number;
+        encrypted_file_key: string | null;
+        plaintext_hash: string | null;
+        plaintext_size: number | null;
       }
     | undefined;
 }
@@ -665,8 +679,8 @@ function restoreRevision(vaultId: string, revisionId: number, deviceId: string):
     const inserted = db
       .prepare(
         `INSERT INTO file_revisions
-          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)`
+          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, plaintext_hash, plaintext_size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         revision.file_id,
@@ -677,6 +691,10 @@ function restoreRevision(vaultId: string, revisionId: number, deviceId: string):
         revision.size,
         deviceId,
         revision.deleted ? 1 : 0,
+        revision.encrypted ? 1 : 0,
+        revision.encrypted_file_key,
+        revision.plaintext_hash,
+        revision.plaintext_size,
         new Date().toISOString()
       );
     db.prepare("UPDATE files SET current_file_revision_id = ?, current_vault_revision = ?, deleted = ?, updated_at = ? WHERE id = ?").run(
@@ -731,16 +749,21 @@ type RiskLevel = "empty" | "high" | "medium" | "very_low";
 function getVaultManifest(vaultId: string): VaultManifest {
   const rows = db
     .prepare(
-      `SELECT f.path, fr.content_hash AS contentHash, fr.size
+      `SELECT f.path, fr.content_hash AS contentHash, fr.size,
+              fr.encrypted, fr.plaintext_hash AS plaintextHash, fr.plaintext_size AS plaintextSize
          FROM files f
          JOIN file_revisions fr ON fr.id = f.current_file_revision_id
         WHERE f.vault_id = ? AND f.deleted = 0
         ORDER BY f.path ASC`
     )
-    .all(vaultId) as Array<{ path: string; contentHash: string | null; size: number }>;
+    .all(vaultId) as Array<{ path: string; contentHash: string | null; size: number; encrypted: number; plaintextHash: string | null; plaintextSize: number | null }>;
   return {
     fileCount: rows.length,
-    manifestHash: sha256(rows.map((row) => `${row.path}\0${row.contentHash ?? ""}\0${row.size}`).join("\n"))
+    manifestHash: sha256(
+      rows
+        .map((row) => `${row.path}\0${row.encrypted ? row.plaintextHash ?? row.contentHash ?? "" : row.contentHash ?? ""}\0${row.encrypted ? row.plaintextSize ?? row.size : row.size}`)
+        .join("\n")
+    )
   };
 }
 

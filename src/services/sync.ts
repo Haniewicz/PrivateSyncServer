@@ -128,7 +128,7 @@ export class SyncService {
   private applyOperation(vaultId: string, vaultRevision: number, batchId: string, deviceId: string, operation: SyncOperation): void {
     const file = this.getOrCreateFile(vaultId, operation.path);
     if (operation.type === "delete") {
-      const revisionId = this.insertFileRevision(file.id, vaultId, vaultRevision, deviceId, true, null, null, 0, operation.encrypted, null);
+      const revisionId = this.insertFileRevision(file.id, vaultId, vaultRevision, deviceId, true, null, null, 0, operation.encrypted, null, null, null);
       this.db
         .prepare("UPDATE files SET current_file_revision_id = ?, current_vault_revision = ?, deleted = 1, updated_at = ? WHERE id = ?")
         .run(revisionId, vaultRevision, this.now(), file.id);
@@ -151,7 +151,9 @@ export class SyncService {
       staged.blob_path,
       staged.size,
       operation.encrypted,
-      operation.encryptedFileKey ?? null
+      operation.encryptedFileKey ?? null,
+      operation.plaintextHash ?? null,
+      operation.plaintextSize ?? null
     );
     this.db
       .prepare("UPDATE files SET current_file_revision_id = ?, current_vault_revision = ?, deleted = 0, updated_at = ? WHERE id = ?")
@@ -168,15 +170,31 @@ export class SyncService {
     blobPath: string | null,
     size: number,
     encrypted = false,
-    encryptedFileKey: string | null = null
+    encryptedFileKey: string | null = null,
+    plaintextHash: string | null = null,
+    plaintextSize: number | null = null
   ): number {
     const result = this.db
       .prepare(
         `INSERT INTO file_revisions
-          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, plaintext_hash, plaintext_size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(fileId, vaultId, vaultRevision, contentHash, blobPath, size, deviceId, deleted ? 1 : 0, encrypted ? 1 : 0, encryptedFileKey, this.now());
+      .run(
+        fileId,
+        vaultId,
+        vaultRevision,
+        contentHash,
+        blobPath,
+        size,
+        deviceId,
+        deleted ? 1 : 0,
+        encrypted ? 1 : 0,
+        encryptedFileKey,
+        plaintextHash,
+        plaintextSize,
+        this.now()
+      );
     return Number(result.lastInsertRowid);
   }
 

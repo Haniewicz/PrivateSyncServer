@@ -67,6 +67,8 @@ export function migrate(db: Database.Database): void {
       deleted INTEGER NOT NULL DEFAULT 0,
       encrypted INTEGER NOT NULL DEFAULT 0,
       encrypted_file_key TEXT,
+      plaintext_hash TEXT,
+      plaintext_size INTEGER,
       created_at TEXT NOT NULL,
       FOREIGN KEY(file_id) REFERENCES files(id),
       FOREIGN KEY(vault_id) REFERENCES vaults(id),
@@ -183,5 +185,13 @@ export function migrate(db: Database.Database): void {
   const deviceColumns = db.prepare("PRAGMA table_info(devices)").all() as { name: string }[];
   if (!deviceColumns.some((column) => column.name === "deleted_at")) {
     db.prepare("ALTER TABLE devices ADD COLUMN deleted_at TEXT").run();
+  }
+
+  const revisionColumns = db.prepare("PRAGMA table_info(file_revisions)").all() as { name: string }[];
+  if (!revisionColumns.some((column) => column.name === "plaintext_hash")) {
+    db.prepare("ALTER TABLE file_revisions ADD COLUMN plaintext_hash TEXT").run();
+  }
+  if (!revisionColumns.some((column) => column.name === "plaintext_size")) {
+    db.prepare("ALTER TABLE file_revisions ADD COLUMN plaintext_size INTEGER").run();
   }
 }
