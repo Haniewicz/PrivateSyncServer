@@ -19,8 +19,11 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 - `POST /api/v1/devices/request`
 - `POST /api/v1/devices/approve`
 - `POST /api/v1/devices/revoke`
+- `GET /api/v1/devices`
 - `GET /api/v1/vaults`
 - `POST /api/v1/vaults`
+- `POST /api/v1/vaults/:vaultId/rename`
+- `POST /api/v1/vaults/:vaultId/delete`
 - `POST /api/v1/vaults/:vaultId/connection-assessment`
 - `POST /api/v1/vaults/:vaultId/sync-state`
 - `GET /api/v1/vaults/:vaultId/changes?since=0`
@@ -37,7 +40,9 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 
 WebSocket działa pod `/api/v1/events?token=DEVICE_TOKEN` i służy tylko do eventów.
 
-Serwer obsługuje wiele vaultów. Setup tworzy domyślny vault `default`, a kolejne można utworzyć przez `POST /api/v1/vaults` z poziomu sparowanego klienta.
+Serwer obsługuje wiele vaultów. Setup tworzy domyślny vault `default`, a kolejne można utworzyć przez `POST /api/v1/vaults` z poziomu sparowanego klienta. Sparowany klient może też zmienić nazwę vaulta przez `POST /api/v1/vaults/:vaultId/rename` albo nieodwracalnie usunąć vault przez `POST /api/v1/vaults/:vaultId/delete`.
+
+`GET /api/v1/devices` zwraca również najnowsze przypisanie urządzenia do vaulta jako `vaultId` i `vaultName`, wyliczane z ostatniego zapisanego `sync-state` dla danego urządzenia.
 
 Przed połączeniem lokalnego vaulta z istniejącym server-vaultem klient może wywołać `POST /api/v1/vaults/:vaultId/connection-assessment`. Serwer porównuje manifest lokalny ze stanem zdalnym i historią wcześniejszych połączeń tej pary `device_id + local_vault_instance_id + vault_id`, a po udanej synchronizacji zapisuje stan przez `POST /api/v1/vaults/:vaultId/sync-state`.
 

@@ -49,6 +49,9 @@ const vaultCreateSchema = z.object({
   id: vaultIdSchema.optional(),
   name: z.string().trim().min(1).max(120)
 });
+const vaultRenameSchema = z.object({
+  name: z.string().trim().min(1).max(120)
+});
 const localVaultInstanceIdSchema = z.string().trim().min(8).max(120);
 const manifestHashSchema = z.string().trim().regex(/^[a-f0-9]{64}$/i);
 const connectionAssessmentSchema = z.object({
@@ -78,7 +81,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       "blob_storage",
       "multiple_vaults",
       "vault_connection_safety",
-      "storage_usage"
+      "storage_usage",
+      "vault_management"
     ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
@@ -165,7 +169,13 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     const result = db.prepare("UPDATE devices SET name = ? WHERE id = ? AND deleted_at IS NULL").run(body.name, request.device!.id);
     if (result.changes === 0) return reply.code(404).send({ error: "device_not_found" });
     const device = db
-      .prepare("SELECT id, name, type, trusted, revoked_at, last_seen_at, created_at FROM devices WHERE id = ? AND deleted_at IS NULL")
+      .prepare(
+        `SELECT d.id, d.name, d.type, d.trusted, d.revoked_at, d.last_seen_at, d.created_at,
+                assigned.vault_id AS vaultId, assigned.vault_name AS vaultName
+           FROM devices d
+           LEFT JOIN (${deviceVaultAssignmentSql()}) assigned ON assigned.device_id = d.id
+          WHERE d.id = ? AND d.deleted_at IS NULL`
+      )
       .get(request.device!.id);
     eventHub.broadcast({ type: "device_updated", device_id: request.device!.id, name: body.name });
     return { ok: true, device };
@@ -203,7 +213,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get("/api/v1/devices", async () => {
     return {
       devices: db
-        .prepare("SELECT id, name, type, trusted, revoked_at, last_seen_at, created_at FROM devices WHERE deleted_at IS NULL ORDER BY created_at DESC")
+        .prepare(
+          `SELECT d.id, d.name, d.type, d.trusted, d.revoked_at, d.last_seen_at, d.created_at,
+                  assigned.vault_id AS vaultId, assigned.vault_name AS vaultName
+             FROM devices d
+             LEFT JOIN (${deviceVaultAssignmentSql()}) assigned ON assigned.device_id = d.id
+            WHERE d.deleted_at IS NULL
+            ORDER BY d.created_at DESC`
+        )
         .all()
     };
   });
@@ -250,6 +267,27 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     if (existing) return reply.code(409).send({ error: "vault_already_exists" });
     db.prepare("INSERT INTO vaults (id, name, current_revision, created_at) VALUES (?, ?, 0, ?)").run(id, body.name, new Date().toISOString());
     return reply.code(201).send({ id, name: body.name, currentRevision: 0 });
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/rename", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    const body = vaultRenameSchema.parse(request.body);
+    const result = db.prepare("UPDATE vaults SET name = ? WHERE id = ?").run(body.name, params.vaultId);
+    if (result.changes === 0) return reply.code(404).send({ error: "vault_not_found" });
+    const vault = db
+      .prepare("SELECT id, name, current_revision AS currentRevision, created_at AS createdAt FROM vaults WHERE id = ?")
+      .get(params.vaultId);
+    eventHub.broadcast({ type: "vault_updated", vault_id: params.vaultId, name: body.name });
+    return vault;
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/delete", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    const vault = db.prepare("SELECT id FROM vaults WHERE id = ?").get(params.vaultId);
+    if (!vault) return reply.code(404).send({ error: "vault_not_found" });
+    deleteVault(params.vaultId);
+    eventHub.broadcast({ type: "vault_deleted", vault_id: params.vaultId });
+    return { ok: true };
   });
 
   fastify.post("/api/v1/vaults/:vaultId/connection-assessment", async (request, reply) => {
@@ -532,6 +570,45 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
     return { ok: true };
   });
+}
+
+function deviceVaultAssignmentSql(): string {
+  return `
+    SELECT ranked.device_id, ranked.vault_id, ranked.vault_name
+      FROM (
+        SELECT vc.device_id, vc.vault_id, v.name AS vault_name,
+               ROW_NUMBER() OVER (
+                 PARTITION BY vc.device_id
+                 ORDER BY vc.last_synced_at DESC, vc.vault_id ASC
+               ) AS rank
+          FROM vault_connections vc
+          JOIN vaults v ON v.id = vc.vault_id
+      ) ranked
+     WHERE ranked.rank = 1
+  `;
+}
+
+function deleteVault(vaultId: string): void {
+  const tx = db.transaction(() => {
+    const batches = db.prepare("SELECT id FROM sync_batches WHERE vault_id = ?").all(vaultId) as { id: string }[];
+    for (const batch of batches) {
+      const uploads = db.prepare("SELECT id, temp_dir FROM staged_chunk_uploads WHERE batch_id = ?").all(batch.id) as { id: string; temp_dir: string }[];
+      for (const upload of uploads) {
+        db.prepare("DELETE FROM staged_chunk_parts WHERE upload_id = ?").run(upload.id);
+        fs.rmSync(upload.temp_dir, { recursive: true, force: true });
+      }
+      db.prepare("DELETE FROM staged_chunk_uploads WHERE batch_id = ?").run(batch.id);
+      db.prepare("DELETE FROM staged_blobs WHERE batch_id = ?").run(batch.id);
+    }
+    db.prepare("DELETE FROM conflicts WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM requests WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM vault_connections WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM file_revisions WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM files WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM sync_batches WHERE vault_id = ?").run(vaultId);
+    db.prepare("DELETE FROM vaults WHERE id = ?").run(vaultId);
+  });
+  tx();
 }
 
 function websocketUrl(host: string, forwardedProto: string | string[] | undefined): string {

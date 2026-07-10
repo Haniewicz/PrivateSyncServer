@@ -6,6 +6,8 @@ export type ServerEvent =
   | { type: "request_resolved"; request_id: string; status: string }
   | { type: "conflict_created"; conflict_id: string; vault_id: string; path: string }
   | { type: "conflict_resolved"; conflict_id: string; vault_id: string; status: string }
+  | { type: "vault_updated"; vault_id: string; name: string }
+  | { type: "vault_deleted"; vault_id: string }
   | { type: "device_revoked"; device_id: string }
   | { type: "device_restored"; device_id: string }
   | { type: "device_updated"; device_id: string; name: string }
