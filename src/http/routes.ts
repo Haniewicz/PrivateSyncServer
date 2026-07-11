@@ -78,6 +78,29 @@ const syncStateSchema = z.object({
   localFileCount: z.number().int().nonnegative(),
   localManifestHash: manifestHashSchema
 });
+const communityPluginIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(160)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+const communityPluginSettingSchema = z.object({
+  relativePath: z.string().trim().min(1).max(500).regex(/^[^/].*\.json$/i),
+  contentBase64: z.string().min(1),
+  contentHash: manifestHashSchema,
+  size: z.number().int().nonnegative().max(1024 * 1024)
+});
+const communityPluginSchema = z.object({
+  id: communityPluginIdSchema,
+  name: z.string().trim().max(160).nullable().optional(),
+  version: z.string().trim().max(80).nullable().optional(),
+  author: z.string().trim().max(160).nullable().optional(),
+  description: z.string().trim().max(500).nullable().optional(),
+  settings: z.array(communityPluginSettingSchema).max(100).optional()
+});
+const communityPluginSyncSchema = z.object({
+  plugins: z.array(communityPluginSchema).max(500)
+});
 
 export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   auth.ensureDefaultVault();
@@ -98,7 +121,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       "storage_usage",
       "vault_management",
       "client_side_encryption_metadata",
-      "vault_encryption_key_rotation"
+      "vault_encryption_key_rotation",
+      "community_plugin_catalog"
     ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
@@ -343,6 +367,20 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     deleteVault(params.vaultId);
     eventHub.broadcast({ type: "vault_deleted", vault_id: params.vaultId });
     return { ok: true };
+  });
+
+  fastify.get("/api/v1/vaults/:vaultId/community-plugins", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    if (!vaultExists(params.vaultId)) return reply.code(404).send({ error: "vault_not_found" });
+    return { plugins: listCommunityPlugins(params.vaultId) };
+  });
+
+  fastify.put("/api/v1/vaults/:vaultId/community-plugins", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    if (!vaultExists(params.vaultId)) return reply.code(404).send({ error: "vault_not_found" });
+    const body = communityPluginSyncSchema.parse(request.body);
+    upsertCommunityPlugins(params.vaultId, request.device!.id, body.plugins);
+    return { ok: true, plugins: listCommunityPlugins(params.vaultId) };
   });
 
   fastify.post("/api/v1/vaults/:vaultId/connection-assessment", async (request, reply) => {
@@ -843,6 +881,82 @@ function vaultIdFromName(name: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 60);
   return vaultIdSchema.safeParse(slug).success ? slug : `vault-${nanoid(8)}`;
+}
+
+type CommunityPluginInput = z.infer<typeof communityPluginSchema>;
+
+function listCommunityPlugins(vaultId: string): unknown[] {
+  const plugins = db
+    .prepare(
+      `SELECT plugin_id AS id, name, version, author, description,
+              source_device_id AS sourceDeviceId, first_seen_at AS firstSeenAt, updated_at AS updatedAt
+         FROM vault_community_plugins
+        WHERE vault_id = ?
+        ORDER BY COALESCE(name, plugin_id) COLLATE NOCASE, plugin_id COLLATE NOCASE`
+    )
+    .all(vaultId) as Array<{ id: string }>;
+  const settings = db
+    .prepare(
+      `SELECT plugin_id AS pluginId, relative_path AS relativePath, content_base64 AS contentBase64,
+              content_hash AS contentHash, size, source_device_id AS sourceDeviceId, updated_at AS updatedAt
+         FROM vault_community_plugin_settings
+        WHERE vault_id = ?
+        ORDER BY plugin_id COLLATE NOCASE, relative_path COLLATE NOCASE`
+    )
+    .all(vaultId) as Array<{ pluginId: string }>;
+  const settingsByPlugin = new Map<string, unknown[]>();
+  for (const setting of settings) {
+    const list = settingsByPlugin.get(setting.pluginId) ?? [];
+    list.push(setting);
+    settingsByPlugin.set(setting.pluginId, list);
+  }
+  return plugins.map((plugin) => ({ ...plugin, settings: settingsByPlugin.get(plugin.id) ?? [] }));
+}
+
+function upsertCommunityPlugins(vaultId: string, deviceId: string, plugins: CommunityPluginInput[]): void {
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    for (const plugin of plugins) {
+      db.prepare(
+        `INSERT INTO vault_community_plugins
+          (vault_id, plugin_id, name, version, author, description, source_device_id, first_seen_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(vault_id, plugin_id)
+         DO UPDATE SET
+           name = COALESCE(excluded.name, vault_community_plugins.name),
+           version = COALESCE(excluded.version, vault_community_plugins.version),
+           author = COALESCE(excluded.author, vault_community_plugins.author),
+           description = COALESCE(excluded.description, vault_community_plugins.description),
+           source_device_id = excluded.source_device_id,
+           updated_at = excluded.updated_at`
+      ).run(
+        vaultId,
+        plugin.id,
+        plugin.name ?? null,
+        plugin.version ?? null,
+        plugin.author ?? null,
+        plugin.description ?? null,
+        deviceId,
+        now,
+        now
+      );
+      for (const setting of plugin.settings ?? []) {
+        db.prepare(
+          `INSERT INTO vault_community_plugin_settings
+            (vault_id, plugin_id, relative_path, content_base64, content_hash, size, source_device_id, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(vault_id, plugin_id, relative_path)
+           DO UPDATE SET
+             content_base64 = excluded.content_base64,
+             content_hash = excluded.content_hash,
+             size = excluded.size,
+             source_device_id = excluded.source_device_id,
+             updated_at = excluded.updated_at`
+        ).run(vaultId, plugin.id, setting.relativePath, setting.contentBase64, setting.contentHash.toLowerCase(), setting.size, deviceId, now);
+      }
+    }
+  });
+  tx();
 }
 
 type VaultManifest = {

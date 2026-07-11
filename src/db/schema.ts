@@ -183,6 +183,35 @@ export function migrate(db: Database.Database): void {
       FOREIGN KEY(device_id) REFERENCES devices(id)
     );
 
+    CREATE TABLE IF NOT EXISTS vault_community_plugins (
+      vault_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      name TEXT,
+      version TEXT,
+      author TEXT,
+      description TEXT,
+      source_device_id TEXT,
+      first_seen_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(vault_id, plugin_id),
+      FOREIGN KEY(vault_id) REFERENCES vaults(id),
+      FOREIGN KEY(source_device_id) REFERENCES devices(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS vault_community_plugin_settings (
+      vault_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      content_base64 TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      source_device_id TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(vault_id, plugin_id, relative_path),
+      FOREIGN KEY(vault_id, plugin_id) REFERENCES vault_community_plugins(vault_id, plugin_id),
+      FOREIGN KEY(source_device_id) REFERENCES devices(id)
+    );
+
     CREATE TABLE IF NOT EXISTS request_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       request_id TEXT NOT NULL,
