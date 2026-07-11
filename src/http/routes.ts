@@ -86,7 +86,7 @@ const communityPluginIdSchema = z
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
 const communityPluginSettingSchema = z.object({
   relativePath: z.string().trim().min(1).max(500).regex(/^[^/].*\.json$/i),
-  contentBase64: z.string().min(1),
+  contentBase64: z.string(),
   contentHash: manifestHashSchema,
   size: z.number().int().nonnegative().max(1024 * 1024)
 });
