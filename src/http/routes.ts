@@ -525,9 +525,17 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     return { ok: true, contentHash: stored.hash, size: stored.size };
   });
 
-  fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/commit", async (request) => {
+  fastify.post("/api/v1/vaults/:vaultId/sync-batches/:batchId/commit", async (request, reply) => {
     const params = z.object({ vaultId: z.string(), batchId: z.string() }).parse(request.params);
-    const result = sync.commitBatch(params.vaultId, params.batchId, request.device!.id);
+    let result: ReturnType<SyncService["commitBatch"]>;
+    try {
+      result = sync.commitBatch(params.vaultId, params.batchId, request.device!.id);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Invalid encryption key for ")) {
+        return reply.code(400).send({ error: "invalid_encryption_key", message: error.message });
+      }
+      throw error;
+    }
     if (result.status === "committed") cleanupBatchStaging(params.batchId);
     return result;
   });
