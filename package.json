@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
     "syncctl": "tsx src/cli/syncctl.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",

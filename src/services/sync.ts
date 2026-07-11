@@ -128,7 +128,7 @@ export class SyncService {
   private applyOperation(vaultId: string, vaultRevision: number, batchId: string, deviceId: string, operation: SyncOperation): void {
     const file = this.getOrCreateFile(vaultId, operation.path);
     if (operation.type === "delete") {
-      const revisionId = this.insertFileRevision(file.id, vaultId, vaultRevision, deviceId, true, null, null, 0, operation.encrypted, null, null, null);
+      const revisionId = this.insertFileRevision(file.id, vaultId, vaultRevision, deviceId, true, null, null, 0, operation.encrypted, null, null, null, null);
       this.db
         .prepare("UPDATE files SET current_file_revision_id = ?, current_vault_revision = ?, deleted = 1, updated_at = ? WHERE id = ?")
         .run(revisionId, vaultRevision, this.now(), file.id);
@@ -140,6 +140,9 @@ export class SyncService {
       .get(batchId, operation.clientChangeId) as { content_hash: string; blob_path: string; size: number } | undefined;
     if (!staged) throw new Error(`Missing staged blob for ${operation.clientChangeId}.`);
     if (operation.contentHash && staged.content_hash !== operation.contentHash) throw new Error(`Hash mismatch for ${operation.path}.`);
+    if (operation.encrypted && !this.isValidEncryptionKey(vaultId, operation.encryptionKeyId ?? null)) {
+      throw new Error(`Invalid encryption key for ${operation.path}.`);
+    }
 
     const revisionId = this.insertFileRevision(
       file.id,
@@ -152,6 +155,7 @@ export class SyncService {
       staged.size,
       operation.encrypted,
       operation.encryptedFileKey ?? null,
+      operation.encryptionKeyId ?? null,
       operation.plaintextHash ?? null,
       operation.plaintextSize ?? null
     );
@@ -171,14 +175,15 @@ export class SyncService {
     size: number,
     encrypted = false,
     encryptedFileKey: string | null = null,
+    encryptionKeyId: string | null = null,
     plaintextHash: string | null = null,
     plaintextSize: number | null = null
   ): number {
     const result = this.db
       .prepare(
         `INSERT INTO file_revisions
-          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, plaintext_hash, plaintext_size, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, encryption_key_id, plaintext_hash, plaintext_size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         fileId,
@@ -191,6 +196,7 @@ export class SyncService {
         deleted ? 1 : 0,
         encrypted ? 1 : 0,
         encryptedFileKey,
+        encryptionKeyId,
         plaintextHash,
         plaintextSize,
         this.now()
@@ -229,6 +235,11 @@ export class SyncService {
       .prepare("INSERT INTO files (id, vault_id, path, deleted, updated_at) VALUES (?, ?, ?, 0, ?)")
       .run(id, vaultId, filePath, this.now());
     return this.getFile(vaultId, filePath)!;
+  }
+
+  private isValidEncryptionKey(vaultId: string, encryptionKeyId: string | null): boolean {
+    if (!encryptionKeyId) return false;
+    return Boolean(this.db.prepare("SELECT 1 FROM vault_encryption_keys WHERE id = ? AND vault_id = ?").get(encryptionKeyId, vaultId));
   }
 
   private isDuplicateChange(deviceId: string, clientChangeId: string): boolean {

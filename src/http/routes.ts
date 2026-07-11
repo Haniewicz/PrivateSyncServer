@@ -38,8 +38,20 @@ const operationSchema = z.object({
   size: z.number().int().nonnegative().optional(),
   encrypted: z.boolean().optional(),
   encryptedFileKey: z.string().nullable().optional(),
+  encryptionKeyId: z.string().nullable().optional(),
   plaintextHash: z.string().nullable().optional(),
   plaintextSize: z.number().int().nonnegative().nullable().optional()
+});
+const encryptionKeyCheckSchema = z.object({
+  keyCheck: z.string().min(1)
+});
+const encryptRevisionSchema = z.object({
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  size: z.number().int().nonnegative(),
+  plaintextHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  plaintextSize: z.number().int().nonnegative(),
+  encryptionKeyId: z.string().min(1),
+  contentBase64: z.string().min(1)
 });
 const vaultIdSchema = z
   .string()
@@ -85,7 +97,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       "vault_connection_safety",
       "storage_usage",
       "vault_management",
-      "client_side_encryption_metadata"
+      "client_side_encryption_metadata",
+      "vault_encryption_key_rotation"
     ],
     maxUploadSize: config.maxUploadSize,
     maxBatchSize: config.maxBatchSize,
@@ -260,7 +273,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   });
 
   fastify.get("/api/v1/vaults", async () => ({
-    vaults: db.prepare("SELECT id, name, current_revision AS currentRevision, created_at AS createdAt FROM vaults").all()
+    vaults: listVaultsWithEncryptionKeys()
   }));
 
   fastify.post("/api/v1/vaults", async (request, reply) => {
@@ -269,7 +282,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     const existing = db.prepare("SELECT id FROM vaults WHERE id = ?").get(id);
     if (existing) return reply.code(409).send({ error: "vault_already_exists" });
     db.prepare("INSERT INTO vaults (id, name, current_revision, created_at) VALUES (?, ?, 0, ?)").run(id, body.name, new Date().toISOString());
-    return reply.code(201).send({ id, name: body.name, currentRevision: 0 });
+    return reply.code(201).send(vaultWithEncryptionKey(id));
   });
 
   fastify.post("/api/v1/vaults/:vaultId/rename", async (request, reply) => {
@@ -277,11 +290,50 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     const body = vaultRenameSchema.parse(request.body);
     const result = db.prepare("UPDATE vaults SET name = ? WHERE id = ?").run(body.name, params.vaultId);
     if (result.changes === 0) return reply.code(404).send({ error: "vault_not_found" });
-    const vault = db
-      .prepare("SELECT id, name, current_revision AS currentRevision, created_at AS createdAt FROM vaults WHERE id = ?")
-      .get(params.vaultId);
     eventHub.broadcast({ type: "vault_updated", vault_id: params.vaultId, name: body.name });
-    return vault;
+    return vaultWithEncryptionKey(params.vaultId);
+  });
+
+  fastify.get("/api/v1/vaults/:vaultId/encryption-keys", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    if (!vaultExists(params.vaultId)) return reply.code(404).send({ error: "vault_not_found" });
+    const keys = db
+      .prepare(
+        `SELECT id, key_check AS keyCheck, active, created_at AS createdAt, retired_at AS retiredAt
+           FROM vault_encryption_keys
+          WHERE vault_id = ?
+          ORDER BY created_at DESC, id DESC`
+      )
+      .all(params.vaultId) as Array<{ id: string; keyCheck: string; active: number; createdAt: string; retiredAt: string | null }>;
+    return {
+      active: keys.find((key) => key.active) ?? null,
+      keys
+    };
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/encryption-keys", async (request, reply) => {
+    const params = z.object({ vaultId: z.string() }).parse(request.params);
+    const body = encryptionKeyCheckSchema.parse(request.body);
+    if (!vaultExists(params.vaultId)) return reply.code(404).send({ error: "vault_not_found" });
+    const now = new Date().toISOString();
+    const key = db.transaction(() => {
+      const active = db
+        .prepare("SELECT id, key_check AS keyCheck FROM vault_encryption_keys WHERE vault_id = ? AND active = 1")
+        .get(params.vaultId) as { id: string; keyCheck: string } | undefined;
+      if (active?.keyCheck === body.keyCheck) return active;
+      db.prepare("UPDATE vault_encryption_keys SET active = 0, retired_at = ? WHERE vault_id = ? AND active = 1").run(now, params.vaultId);
+      const id = nanoid();
+      db.prepare("INSERT INTO vault_encryption_keys (id, vault_id, key_check, active, created_at) VALUES (?, ?, ?, 1, ?)").run(
+        id,
+        params.vaultId,
+        body.keyCheck,
+        now
+      );
+      const vault = db.prepare("SELECT name FROM vaults WHERE id = ?").get(params.vaultId) as { name: string };
+      eventHub.broadcast({ type: "vault_updated", vault_id: params.vaultId, name: vault.name });
+      return { id, keyCheck: body.keyCheck };
+    })();
+    return reply.code(201).send({ id: key.id, keyCheck: key.keyCheck, active: true, createdAt: now });
   });
 
   fastify.post("/api/v1/vaults/:vaultId/delete", async (request, reply) => {
@@ -358,7 +410,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
         .prepare(
           `SELECT fr.id AS fileRevisionId, fr.vault_revision AS vaultRevision, f.path, fr.content_hash AS contentHash,
                   fr.size, fr.plaintext_hash AS plaintextHash, fr.plaintext_size AS plaintextSize,
-                  fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
+                  fr.deleted, fr.encrypted, fr.encryption_key_id AS encryptionKeyId, fr.device_id AS deviceId, fr.created_at AS createdAt
              FROM file_revisions fr
              JOIN files f ON f.id = fr.file_id
             WHERE fr.vault_id = ? AND fr.vault_revision > ?
@@ -519,7 +571,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
         .prepare(
           `SELECT fr.id, fr.vault_revision AS vaultRevision, fr.content_hash AS contentHash, fr.size,
                   fr.plaintext_hash AS plaintextHash, fr.plaintext_size AS plaintextSize,
-                  fr.deleted, fr.encrypted, fr.device_id AS deviceId, fr.created_at AS createdAt
+                  fr.deleted, fr.encrypted, fr.encryption_key_id AS encryptionKeyId, fr.device_id AS deviceId, fr.created_at AS createdAt
              FROM files f
              JOIN file_revisions fr ON fr.file_id = f.id
             WHERE f.vault_id = ? AND f.path = ?
@@ -543,6 +595,28 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     const restored = restoreRevision(params.vaultId, params.revisionId, request.device!.id);
     if (!restored) return reply.code(404).send({ error: "revision_not_found" });
     return restored;
+  });
+
+  fastify.post("/api/v1/vaults/:vaultId/files/revisions/:revisionId/encrypt", async (request, reply) => {
+    const params = z.object({ vaultId: z.string(), revisionId: z.coerce.number().int().positive() }).parse(request.params);
+    const body = encryptRevisionSchema.parse(request.body);
+    const revision = getFileRevision(params.vaultId, params.revisionId);
+    if (!revision || revision.deleted || !revision.blob_path) return reply.code(404).send({ error: "revision_not_downloadable" });
+    if (revision.encrypted) return reply.code(409).send({ error: "revision_already_encrypted" });
+    if (revision.content_hash !== body.plaintextHash || revision.size !== body.plaintextSize) return reply.code(409).send({ error: "revision_plaintext_mismatch" });
+    const key = db
+      .prepare("SELECT id FROM vault_encryption_keys WHERE id = ? AND vault_id = ?")
+      .get(body.encryptionKeyId, params.vaultId);
+    if (!key) return reply.code(400).send({ error: "encryption_key_not_found" });
+    const content = Buffer.from(body.contentBase64, "base64");
+    const stored = blobs.put(content);
+    if (stored.hash !== body.contentHash || stored.size !== body.size) return reply.code(400).send({ error: "encrypted_content_mismatch" });
+    db.prepare(
+      `UPDATE file_revisions
+          SET content_hash = ?, blob_path = ?, size = ?, encrypted = 1, encryption_key_id = ?, plaintext_hash = ?, plaintext_size = ?
+        WHERE id = ? AND vault_id = ? AND encrypted = 0`
+    ).run(stored.hash, stored.relativePath, stored.size, body.encryptionKeyId, body.plaintextHash, body.plaintextSize, params.revisionId, params.vaultId);
+    return { ok: true, contentHash: stored.hash, size: stored.size, encryptionKeyId: body.encryptionKeyId };
   });
 
   fastify.get("/api/v1/vaults/:vaultId/requests", async (request) => {
@@ -639,6 +713,7 @@ function getFileRevision(vaultId: string, revisionId: number):
       deleted: number;
       encrypted: number;
       encrypted_file_key: string | null;
+      encryption_key_id: string | null;
       plaintext_hash: string | null;
       plaintext_size: number | null;
     }
@@ -646,7 +721,7 @@ function getFileRevision(vaultId: string, revisionId: number):
   return db
     .prepare(
       `SELECT fr.id, fr.file_id, f.path, fr.vault_id, fr.content_hash, fr.blob_path, fr.size, fr.deleted,
-              fr.encrypted, fr.encrypted_file_key, fr.plaintext_hash, fr.plaintext_size
+              fr.encrypted, fr.encrypted_file_key, fr.encryption_key_id, fr.plaintext_hash, fr.plaintext_size
          FROM file_revisions fr
          JOIN files f ON f.id = fr.file_id
         WHERE fr.vault_id = ? AND fr.id = ?`
@@ -663,6 +738,7 @@ function getFileRevision(vaultId: string, revisionId: number):
         deleted: number;
         encrypted: number;
         encrypted_file_key: string | null;
+        encryption_key_id: string | null;
         plaintext_hash: string | null;
         plaintext_size: number | null;
       }
@@ -679,8 +755,8 @@ function restoreRevision(vaultId: string, revisionId: number, deviceId: string):
     const inserted = db
       .prepare(
         `INSERT INTO file_revisions
-          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, plaintext_hash, plaintext_size, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (file_id, vault_id, vault_revision, content_hash, blob_path, size, device_id, deleted, encrypted, encrypted_file_key, encryption_key_id, plaintext_hash, plaintext_size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         revision.file_id,
@@ -693,6 +769,7 @@ function restoreRevision(vaultId: string, revisionId: number, deviceId: string):
         revision.deleted ? 1 : 0,
         revision.encrypted ? 1 : 0,
         revision.encrypted_file_key,
+        revision.encryption_key_id,
         revision.plaintext_hash,
         revision.plaintext_size,
         new Date().toISOString()
@@ -709,6 +786,34 @@ function restoreRevision(vaultId: string, revisionId: number, deviceId: string):
     return { ok: true as const, revision: vaultRevision, path: revision.path };
   });
   return tx();
+}
+
+function vaultExists(vaultId: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM vaults WHERE id = ?").get(vaultId));
+}
+
+function listVaultsWithEncryptionKeys(): unknown[] {
+  return db
+    .prepare(
+      `SELECT v.id, v.name, v.current_revision AS currentRevision, v.created_at AS createdAt,
+              k.id AS encryptionKeyId, k.key_check AS encryptionKeyCheck
+         FROM vaults v
+         LEFT JOIN vault_encryption_keys k ON k.vault_id = v.id AND k.active = 1
+        ORDER BY v.name COLLATE NOCASE, v.id`
+    )
+    .all();
+}
+
+function vaultWithEncryptionKey(vaultId: string): unknown {
+  return db
+    .prepare(
+      `SELECT v.id, v.name, v.current_revision AS currentRevision, v.created_at AS createdAt,
+              k.id AS encryptionKeyId, k.key_check AS encryptionKeyCheck
+         FROM vaults v
+         LEFT JOIN vault_encryption_keys k ON k.vault_id = v.id AND k.active = 1
+        WHERE v.id = ?`
+    )
+    .get(vaultId);
 }
 
 function parseApprovedDeviceDecision(decisionJson: string | null): { deviceId: string; deviceToken: string } | null {

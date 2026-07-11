@@ -43,6 +43,16 @@ export function migrate(db: Database.Database): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS vault_encryption_keys (
+      id TEXT PRIMARY KEY,
+      vault_id TEXT NOT NULL,
+      key_check TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      retired_at TEXT,
+      FOREIGN KEY(vault_id) REFERENCES vaults(id)
+    );
+
     CREATE TABLE IF NOT EXISTS files (
       id TEXT PRIMARY KEY,
       vault_id TEXT NOT NULL,
@@ -67,12 +77,14 @@ export function migrate(db: Database.Database): void {
       deleted INTEGER NOT NULL DEFAULT 0,
       encrypted INTEGER NOT NULL DEFAULT 0,
       encrypted_file_key TEXT,
+      encryption_key_id TEXT,
       plaintext_hash TEXT,
       plaintext_size INTEGER,
       created_at TEXT NOT NULL,
       FOREIGN KEY(file_id) REFERENCES files(id),
       FOREIGN KEY(vault_id) REFERENCES vaults(id),
-      FOREIGN KEY(device_id) REFERENCES devices(id)
+      FOREIGN KEY(device_id) REFERENCES devices(id),
+      FOREIGN KEY(encryption_key_id) REFERENCES vault_encryption_keys(id)
     );
 
     CREATE TABLE IF NOT EXISTS sync_batches (
@@ -188,6 +200,9 @@ export function migrate(db: Database.Database): void {
   }
 
   const revisionColumns = db.prepare("PRAGMA table_info(file_revisions)").all() as { name: string }[];
+  if (!revisionColumns.some((column) => column.name === "encryption_key_id")) {
+    db.prepare("ALTER TABLE file_revisions ADD COLUMN encryption_key_id TEXT").run();
+  }
   if (!revisionColumns.some((column) => column.name === "plaintext_hash")) {
     db.prepare("ALTER TABLE file_revisions ADD COLUMN plaintext_hash TEXT").run();
   }
