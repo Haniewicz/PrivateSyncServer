@@ -1,6 +1,6 @@
 {
   "name": "private-sync-server",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Private Obsidian vault synchronization server.",
   "type": "module",
   "scripts": {

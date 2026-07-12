@@ -1,29 +1,256 @@
 # Private Sync Server
 
-Pierwotna wersja serwera synchronizacji vaultów Obsidiana.
+Private Sync Server to prywatny backend synchronizacji vaultow Obsidiana dla pluginu Private Sync.
 
-## Uruchomienie
+Plugin Obsidiana: https://github.com/Haniewicz/PrivateSyncPlugin
+
+Serwer przechowuje logiczny stan vaultow w SQLite oraz tresc plikow jako bloby na dysku. Nie przechowuje gotowego katalogu vaulta Obsidiana jeden do jednego. Lokalny vault jest odtwarzany i aktualizowany przez plugin na podstawie rewizji pobieranych z API.
+
+## Wymagania
+
+- Linux VPS albo inny host z Node.js.
+- Node.js 22 LTS lub nowszy.
+- `npm`.
+- `git`.
+- Reverse proxy z HTTPS, np. Caddy albo Nginx, jesli serwer ma byc dostepny z internetu.
+- Staly katalog danych, np. `/var/lib/private-sync-server`.
+
+## Szybki start developerski
 
 ```bash
+git clone https://github.com/Haniewicz/PrivateSyncServer.git
+cd PrivateSyncServer
 npm install
 npm run syncctl -- setup --password "zmien-to-haslo"
 npm run dev
 ```
 
-Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/server.sqlite` i `data/blobs`.
+Domyslnie serwer slucha na `http://127.0.0.1:8787`, a dane trzyma w `data/server.sqlite` i `data/blobs`.
 
-## Najważniejsze elementy MVP
+## Instalacja produkcyjna krok po kroku
+
+Ponizszy przyklad instaluje serwer w `/opt/private-sync-server`, dane trzyma w `/var/lib/private-sync-server`, a proces uruchamia przez systemd.
+
+### 1. Zainstaluj pakiety systemowe
+
+Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y git curl ca-certificates build-essential
+```
+
+Zainstaluj Node.js 22 LTS. Przyklad przez NodeSource:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+node --version
+npm --version
+```
+
+### 2. Utworz uzytkownika i katalogi
+
+```bash
+sudo useradd --system --home /opt/private-sync-server --shell /usr/sbin/nologin private-sync
+sudo mkdir -p /opt/private-sync-server
+sudo mkdir -p /var/lib/private-sync-server
+sudo chown -R private-sync:private-sync /opt/private-sync-server /var/lib/private-sync-server
+```
+
+### 3. Pobierz kod
+
+```bash
+sudo -u private-sync git clone https://github.com/Haniewicz/PrivateSyncServer.git /opt/private-sync-server
+cd /opt/private-sync-server
+sudo -u private-sync npm ci
+sudo -u private-sync npm run build
+```
+
+### 4. Skonfiguruj haslo serwera
+
+Haslo musi miec co najmniej 8 znakow.
+
+```bash
+cd /opt/private-sync-server
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- setup --password "wstaw-mocne-haslo"
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config show
+```
+
+`setup` tworzy baze SQLite, ustawia haslo serwera i wlacza initial setup dla pierwszego zaufanego urzadzenia. Pierwsze urzadzenie moze sparowac sie bez akceptacji z innego urzadzenia. Kolejne urzadzenia wymagaja akceptacji albo recovery pairing code.
+
+### 5. Dodaj plik environment
+
+```bash
+sudo tee /etc/private-sync-server.env >/dev/null <<'EOF'
+NODE_ENV=production
+HOST=127.0.0.1
+PORT=8787
+PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server
+TRUST_PROXY=true
+AUTH_RATE_LIMIT_MAX=10
+AUTH_RATE_LIMIT_WINDOW_SECONDS=60
+PAIRING_STATUS_RATE_LIMIT_MAX=30
+PAIRING_STATUS_RATE_LIMIT_WINDOW_SECONDS=60
+EOF
+sudo chmod 600 /etc/private-sync-server.env
+```
+
+Najwazniejsze zmienne:
+
+- `HOST` - adres nasluchiwania aplikacji, domyslnie `127.0.0.1`.
+- `PORT` - port aplikacji, domyslnie `8787`.
+- `PRIVATE_SYNC_DATA_DIR` - katalog danych, domyslnie `./data`.
+- `DATABASE_PATH` - opcjonalna sciezka do SQLite, domyslnie `$PRIVATE_SYNC_DATA_DIR/server.sqlite`.
+- `BLOB_DIR` - opcjonalny katalog blobow, domyslnie `$PRIVATE_SYNC_DATA_DIR/blobs`.
+- `TRUST_PROXY` - ustaw `true`, gdy serwer stoi za reverse proxy.
+
+### 6. Dodaj service systemd
+
+```bash
+sudo tee /etc/systemd/system/private-sync-server.service >/dev/null <<'EOF'
+[Unit]
+Description=Private Sync Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=private-sync
+Group=private-sync
+WorkingDirectory=/opt/private-sync-server
+EnvironmentFile=/etc/private-sync-server.env
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/private-sync-server /opt/private-sync-server
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now private-sync-server.service
+sudo systemctl status private-sync-server.service
+```
+
+### 7. Skonfiguruj HTTPS reverse proxy
+
+Przyklad Caddy:
+
+```caddyfile
+sync.example.com {
+  reverse_proxy 127.0.0.1:8787
+}
+```
+
+Przyklad Nginx:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name sync.example.com;
+
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+```
+
+WebSocket dziala pod `/api/v1/events?token=DEVICE_TOKEN`, dlatego reverse proxy musi obslugiwac upgrade HTTP.
+
+### 8. Sprawdz instalacje
+
+```bash
+curl https://sync.example.com/api/v1/server-info
+cd /opt/private-sync-server
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password http-verify --url "https://sync.example.com"
+```
+
+W pluginie Obsidiana wpisz `Server URL` jako `https://sync.example.com`.
+
+## Aktualizacja serwera
+
+```bash
+cd /opt/private-sync-server
+sudo -u private-sync git pull --ff-only origin master
+sudo -u private-sync npm ci
+sudo -u private-sync npm run build
+sudo systemctl restart private-sync-server.service
+sudo systemctl status private-sync-server.service
+curl https://sync.example.com/api/v1/server-info
+```
+
+Migracje SQLite sa wykonywane automatycznie przy starcie procesu.
+
+## Backup i odtwarzanie
+
+Backup musi obejmowac jednoczesnie:
+
+- baze SQLite, domyslnie `/var/lib/private-sync-server/server.sqlite`,
+- katalog blobow, domyslnie `/var/lib/private-sync-server/blobs`,
+- katalog staging, jesli chcesz zachowac niedokonczone uploady, domyslnie `/var/lib/private-sync-server/staging`.
+
+Najprostszy backup przy zatrzymanej usludze:
+
+```bash
+sudo systemctl stop private-sync-server.service
+sudo tar -czf private-sync-backup-$(date +%F).tar.gz -C /var/lib private-sync-server
+sudo systemctl start private-sync-server.service
+```
+
+Przy backupie online uzyj narzedzia obslugujacego spojny snapshot filesystemu albo SQLite backup API. Nie kopiuj samego katalogu `blobs` bez odpowiadajacej mu bazy SQLite.
+
+## Komendy administracyjne
+
+Uruchamiaj komendy z tym samym `PRIVATE_SYNC_DATA_DIR`, ktorego uzywa systemd:
+
+```bash
+cd /opt/private-sync-server
+
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config show
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password verify
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password reset
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password reset --password "nowe-haslo"
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password http-verify --url "https://sync.example.com"
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- pairing-code create --ttl=10m
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- initial-setup enable
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- initial-setup disable
+```
+
+`pairing-code create` tworzy jednorazowy recovery pairing code. Taki kod pozwala sparowac nowe urzadzenie bez akceptacji na innym urzadzeniu, ale nadal wymaga hasla serwera w pluginie.
+
+`password reset` zmienia glowne haslo logowania do serwera. Nie uniewaznia istniejacych `device_token` i nie odzyskuje ani nie zmienia kluczy szyfrowania danych.
+
+## API i funkcje
+
+Najwazniejsze endpointy:
 
 - `GET /api/v1/server-info`
 - `POST /api/v1/auth/login`
 - `POST /api/v1/devices/request`
 - `POST /api/v1/devices/approve`
 - `POST /api/v1/devices/revoke`
+- `POST /api/v1/devices/restore`
+- `POST /api/v1/devices/delete`
 - `GET /api/v1/devices`
 - `GET /api/v1/vaults`
 - `POST /api/v1/vaults`
 - `POST /api/v1/vaults/:vaultId/rename`
 - `POST /api/v1/vaults/:vaultId/delete`
+- `GET /api/v1/vaults/:vaultId/community-plugins`
+- `PUT /api/v1/vaults/:vaultId/community-plugins`
 - `POST /api/v1/vaults/:vaultId/connection-assessment`
 - `POST /api/v1/vaults/:vaultId/sync-state`
 - `GET /api/v1/vaults/:vaultId/changes?since=0`
@@ -38,180 +265,73 @@ Domyślnie serwer słucha na `http://127.0.0.1:8787`, a dane trzyma w `data/serv
 - `GET /api/v1/vaults/:vaultId/requests`
 - `POST /api/v1/vaults/:vaultId/requests/:requestId/resolve`
 
-WebSocket działa pod `/api/v1/events?token=DEVICE_TOKEN` i służy tylko do eventów.
+Funkcje serwera:
 
-Serwer obsługuje wiele vaultów. Setup tworzy domyślny vault `default`, a kolejne można utworzyć przez `POST /api/v1/vaults` z poziomu sparowanego klienta. Sparowany klient może też zmienić nazwę vaulta przez `POST /api/v1/vaults/:vaultId/rename` albo nieodwracalnie usunąć vault przez `POST /api/v1/vaults/:vaultId/delete`.
+- wiele server-vaultow,
+- device tokens,
+- recovery pairing code,
+- batch upload i commit,
+- chunked upload/download duzych plikow,
+- globalne rewizje vaulta,
+- historia plikow,
+- konflikty i requesty decyzyjne,
+- ocena bezpieczenstwa laczenia lokalnego vaulta z server-vaultem,
+- katalog community pluginow i JSON-owych plikow ustawien,
+- metadane klientowego szyfrowania i rotacji kluczy.
 
-`GET /api/v1/devices` zwraca również najnowsze przypisanie urządzenia do vaulta jako `vaultId` i `vaultName`, wyliczane z ostatniego zapisanego `sync-state` dla danego urządzenia.
+## Jak dziala backend
 
-Przed połączeniem lokalnego vaulta z istniejącym server-vaultem klient może wywołać `POST /api/v1/vaults/:vaultId/connection-assessment`. Serwer porównuje manifest lokalny ze stanem zdalnym i historią wcześniejszych połączeń tej pary `device_id + local_vault_instance_id + vault_id`, a po udanej synchronizacji zapisuje stan przez `POST /api/v1/vaults/:vaultId/sync-state`.
+Serwer dziala jako pojedyncza aplikacja Node.js/Fastify.
 
-## Jak działa backend i jak oszacować VPS
-
-Ten backend jest prywatnym serwerem synchronizacji vaultów Obsidiana. Nie renderuje stron i nie wykonuje ciężkiej logiki UI. Jego główne zadania to przyjmowanie zmian z pluginów, zapisywanie metadanych w SQLite, zapisywanie treści plików jako bloby na dysku, tworzenie globalnych rewizji vaulta oraz informowanie innych urządzeń przez WebSocket, że powinny pobrać zmiany przez API.
-
-### Model pracy
-
-- Serwer działa jako pojedyncza aplikacja Node.js/TypeScript oparta o Fastify.
-- Baza metadanych to lokalny plik SQLite: `data/server.sqlite`.
-- Treść plików jest trzymana poza bazą w katalogu blobów: `data/blobs`.
-- Pliki są identyfikowane po SHA-256 treści, więc ta sama zawartość nie musi być zapisywana drugi raz.
-- WebSocket nie przesyła plików. Służy tylko do krótkich eventów, np. `vault_changed`, `request_created`, `conflict_created`.
-- Realne operacje synchronizacji idą przez HTTP API.
-- Każde urządzenie ma osobny `device_token`.
-- Upload zmian odbywa się batchami:
-  - plugin tworzy batch z listą operacji,
-  - wysyła treści zmienionych plików do staging area,
+- Baza metadanych to SQLite.
+- Tresc plikow jest trzymana w katalogu blobow po SHA-256.
+- WebSocket nie przesyla plikow. Sluzy tylko do eventow, np. `vault_changed`, `request_created`, `conflict_created`.
+- Realne operacje synchronizacji ida przez HTTP API.
+- Upload zmian odbywa sie batchami:
+  - plugin tworzy batch z lista operacji,
+  - wysyla tresci zmienionych plikow do staging area,
   - prosi serwer o commit batcha,
-  - serwer waliduje batch i dopiero wtedy publikuje nową globalną rewizję vaulta.
-- Jeśli batch jest przerwany w połowie, niedokończone pliki stagingowe nie stają się aktualnym stanem vaulta.
-- Duże uploady mogą być wysyłane w chunkach. Serwer zapisuje części w `data/staging`, składa finalny blob na dysku i weryfikuje hash oraz rozmiar przed oznaczeniem pliku jako staged.
-- Download pliku obsługuje nagłówek `Range`, więc klient może pobierać duże pliki fragmentami.
-- Serwer wykrywa konflikty przez porównanie `base_revision_id` z aktualną rewizją pliku na serwerze.
-- Serwer wykrywa potencjalnie niebezpieczne operacje, np. masowe usuwanie, i zatrzymuje batch do decyzji użytkownika.
+  - serwer waliduje batch i publikuje nowa globalna rewizje vaulta.
+- Jesli batch jest przerwany w polowie, niedokonczone pliki stagingowe nie staja sie aktualnym stanem vaulta.
+- Serwer wykrywa konflikty przez porownanie `base_revision_id` z aktualna rewizja pliku na serwerze.
+- Serwer wykrywa potencjalnie niebezpieczne operacje, np. masowe usuwanie, i zatrzymuje batch do decyzji uzytkownika.
 
-### Co obciąża serwer
+## Dobor VPS
 
-Najważniejsze źródła obciążenia:
-
-- upload i download plików,
-- zapis/odczyt blobów z dysku,
-- zapis/odczyt części uploadu w `data/staging` dla dużych plików,
-- obliczanie SHA-256 uploadowanych treści,
-- transakcje SQLite podczas commitowania batchy,
-- liczba jednocześnie podłączonych urządzeń WebSocket,
-- liczba plików i rewizji w vaultcie,
-- rozmiar historii wersji,
-- częstotliwość zmian lokalnych na urządzeniach.
-
-Node.js nie powinien być głównym ograniczeniem dla małego prywatnego wdrożenia. Wąskim gardłem szybciej będzie dysk VPS, przepustowość sieci, rozmiar uploadów/downloadów i liczba zapisów do SQLite.
-
-### Charakterystyka ruchu
-
-Typowy sync jednego urządzenia wygląda tak:
-
-1. Plugin skanuje lokalne zmiany i buduje batch.
-2. Plugin wysyła `POST /sync-batches` z metadanymi operacji.
-3. Dla każdego zmienionego pliku plugin wysyła `POST /upload`.
-4. Plugin wysyła `POST /commit`.
-5. Serwer zapisuje rewizję globalną i rozsyła krótki event `vault_changed`.
-6. Inne urządzenia robią `GET /changes?since=last_applied_revision`.
-7. Jeśli potrzebują treści pliku, pobierają ją przez `GET /files/download`.
-
-WebSockety utrzymują otwarte połączenia, ale w normalnej pracy generują bardzo mały ruch. Większy ruch pojawia się dopiero przy synchronizacji plików.
-
-### Parametry potrzebne do dobrania VPS
-
-Żeby ocenić minimalną specyfikację VPS, trzeba znać:
-
-- liczba użytkowników,
-- liczba urządzeń na użytkownika,
-- ile urządzeń może synchronizować jednocześnie,
-- rozmiar vaulta,
-- liczba plików w vaultcie,
-- średni rozmiar pliku,
-- największy spodziewany plik,
-- dzienna liczba zmian,
-- ile danych dziennie będzie uploadowane,
-- ile danych dziennie będzie pobierane przez inne urządzenia,
-- czy synchronizowane będą głównie pliki Markdown, czy też dużo załączników,
-- jak długo ma być trzymana historia wersji,
-- czy VPS ma obsługiwać tylko API, czy także reverse proxy, TLS, backupy i monitoring.
-
-Przykładowy opis do estymacji:
-
-```text
-Backend: Node.js/Fastify, SQLite, lokalny filesystem blob storage.
-Rola: prywatny serwer synchronizacji Obsidiana.
-Użytkownicy: X.
-Urządzenia: Y na użytkownika.
-Jednoczesne urządzenia online: Z.
-Vault: N plików, łącznie S GB.
-Największy plik: M MB.
-Zmiany dziennie: C plików / D MB uploadu.
-Historia: np. 100 wersji dla małych plików Markdown, ograniczona historia załączników.
-Ruch: WebSocket tylko eventy, pliki przez HTTP upload/download.
-Storage: SQLite dla metadanych, bloby na dysku po SHA-256.
-Wymagania: prywatny sync, niska/średnia liczba użytkowników, ważniejsza niezawodność dysku i backup niż duża moc CPU.
-```
-
-### Orientacyjne klasy VPS
-
-Dla jednej osoby i kilku urządzeń zwykle wystarczy mały VPS:
+Dla jednej osoby i kilku urzadzen zwykle wystarczy:
 
 - 1 vCPU,
 - 1-2 GB RAM,
-- 20-40 GB SSD plus miejsce na historię i backupy,
-- regularny backup katalogu `data/`.
+- 20-40 GB SSD plus miejsce na historie i backupy,
+- regularny backup katalogu danych.
 
-Dla kilku osób albo dużego vaulta z załącznikami lepiej zacząć od:
+Dla kilku osob albo duzego vaulta z zalacznikami lepiej zaczac od:
 
 - 2 vCPU,
 - 2-4 GB RAM,
 - 80+ GB SSD/NVMe,
-- limit uploadu dopasowany do największych plików,
+- limit uploadu dopasowany do najwiekszych plikow,
 - automatyczne backupy SQLite i blob storage.
 
-Dla większego użycia warto rozważyć:
+Przy wiekszym uzyciu warto rozwazyc PostgreSQL, object storage dla blobow, kolejke workerow, quota per uzytkownik, metryki i alerty.
 
-- PostgreSQL zamiast SQLite,
-- osobny object storage dla blobów,
-- worker queue dla cięższych zadań,
-- limity rate-limit i quota per użytkownik,
-- metryki, log rotation i alerty.
+## Diagnostyka
 
-### Ważne uwagi produkcyjne
-
-- SQLite jest dobrym wyborem na prywatny MVP, ale przy wielu równoczesnych zapisach PostgreSQL będzie bezpieczniejszym kierunkiem.
-- Katalog `data/` jest krytyczny: zawiera bazę metadanych i treści plików.
-- Backup musi obejmować jednocześnie `data/server.sqlite` i `data/blobs`.
-- Serwer powinien stać za reverse proxy z HTTPS, np. Caddy albo Nginx.
-- Warto ograniczyć maksymalny rozmiar uploadu na reverse proxy zgodnie z `maxUploadSize`.
-- WebSocket wymaga poprawnego proxy upgrade.
-- Obecna wersja jest szkieletem MVP, nie gotowym hardened deploymentem.
-
-## Komendy administracyjne
+Logi systemd:
 
 ```bash
-npm run syncctl -- setup --password "zmien-to-haslo"
-npm run syncctl -- config show
-npm run syncctl -- password reset
-npm run syncctl -- password reset --password "nowe-haslo"
-npm run syncctl -- password verify
-npm run syncctl -- password verify --password "nowe-haslo"
-npm run syncctl -- password http-verify --url "https://twoj-serwer.example"
-npm run syncctl -- password http-verify --url "https://twoj-serwer.example" --password "nowe-haslo"
-npm run syncctl -- pairing-code create --ttl=10m
-npm run syncctl -- initial-setup enable
+sudo journalctl -u private-sync-server.service -f
 ```
 
-`password reset` zmienia główne hasło logowania do serwera. Nie unieważnia istniejących `device_token` i nie odzyskuje ani nie zmienia kluczy szyfrowania danych, jeśli szyfrowanie E2E zostanie dodane później.
-
-Jeśli po resecie plugin nadal zwraca `invalid_password`, najpierw sprawdź, czy resetujesz tę samą bazę SQLite, której używa uruchomiony serwer. `syncctl` używa zmiennych `PRIVATE_SYNC_DATA_DIR` i `DATABASE_PATH` tak samo jak serwer, więc przy instalacji systemd trzeba uruchamiać komendy z tym samym env:
+Jesli plugin zwraca `invalid_password`, sprawdz czy CLI i publiczny URL korzystaja z tej samej bazy:
 
 ```bash
-PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config show
-PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password verify
-PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password reset
+cd /opt/private-sync-server
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- config show
+curl https://sync.example.com/api/v1/server-info
+sudo -u private-sync PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password http-verify --url "https://sync.example.com"
 ```
 
-Jeśli `password verify` działa, ale plugin nadal dostaje `invalid_password`, sprawdź ten sam publiczny URL, który wpisujesz w pluginie:
+Porownaj `instanceId` z `config show` i `/server-info`. Jesli jest rozny, CLI i publiczny URL trafiaja w inne instancje albo inne bazy.
 
-```bash
-PRIVATE_SYNC_DATA_DIR=/var/lib/private-sync-server npm run syncctl -- password http-verify --url "https://twoj-serwer.example"
-```
-
-Jeśli `http-verify` nie działa, plugin trafia w inną instancję, zły reverse proxy albo inny URL niż baza sprawdzona przez `password verify`.
-
-Porównaj też `instanceId` z:
-
-```bash
-npm run syncctl -- config show
-curl https://twoj-serwer.example/api/v1/server-info
-```
-
-Jeśli `instanceId` jest różny, CLI i publiczny URL korzystają z różnych baz/instancji.
-
-Po `password reset` restart serwera nie jest wymagany, bo hash hasła jest czytany z bazy przy każdym logowaniu.
-
-To jest baza pod dalszy rozwój: staging batchy, globalne rewizje, historia plików, device tokeny, requesty decyzyjne i konflikty są już modelowane w bazie.
+Po `password reset` restart serwera nie jest wymagany, bo hash hasla jest czytany z bazy przy kazdym logowaniu.

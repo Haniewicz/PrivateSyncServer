@@ -43,7 +43,7 @@ export const config: ServerConfig = {
   databasePath: process.env.DATABASE_PATH ?? path.join(dataDir, "server.sqlite"),
   blobDir: process.env.BLOB_DIR ?? path.join(dataDir, "blobs"),
   protocolVersion: "1",
-  serverVersion: "0.1.0",
+  serverVersion: "1.0.0",
   maxUploadSize: 100 * 1024 * 1024,
   maxBatchSize: 500,
   trustProxy: booleanEnv("TRUST_PROXY"),
