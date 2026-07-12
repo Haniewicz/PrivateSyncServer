@@ -18,6 +18,20 @@ type BatchRow = {
   device_id: string;
   status: string;
   operations_json: string;
+  committed_revision: number | null;
+};
+
+type CommittedFileRevision = {
+  path: string;
+  fileRevisionId: number | null;
+};
+
+type CommitBatchResult = {
+  status: string;
+  revision?: number;
+  fileRevisions?: CommittedFileRevision[];
+  requestId?: string;
+  conflicts?: string[];
 };
 
 export class SyncService {
@@ -55,15 +69,21 @@ export class SyncService {
     batchId: string,
     deviceId: string,
     options: { skipDangerousOperationCheck?: boolean } = {}
-  ): { status: string; revision?: number; requestId?: string; conflicts?: string[] } {
+  ): CommitBatchResult {
     const tx = this.db.transaction(() => {
       const batch = this.db.prepare("SELECT * FROM sync_batches WHERE id = ? AND vault_id = ?").get(batchId, vaultId) as BatchRow | undefined;
       if (!batch) throw new Error("Batch not found.");
       if (batch.device_id !== deviceId) throw new Error("Batch belongs to another device.");
-      if (batch.status === "committed") return { status: "committed", revision: this.getVaultRevision(vaultId) };
+      const operations = JSON.parse(batch.operations_json) as SyncOperation[];
+      if (batch.status === "committed") {
+        return {
+          status: "committed",
+          revision: this.getVaultRevision(vaultId),
+          fileRevisions: this.getCommittedFileRevisions(vaultId, operations, batch.committed_revision)
+        };
+      }
 
       this.db.prepare("UPDATE sync_batches SET status = 'validating', updated_at = ? WHERE id = ?").run(this.now(), batchId);
-      const operations = JSON.parse(batch.operations_json) as SyncOperation[];
       if (!options.skipDangerousOperationCheck) {
         const dangerousRequest = this.detectDangerousOperations(vaultId, batchId, deviceId, operations);
         if (dangerousRequest) return dangerousRequest;
@@ -90,6 +110,7 @@ export class SyncService {
       for (const operation of operations) {
         if (this.isDuplicateChange(deviceId, operation.clientChangeId)) continue;
         this.applyOperation(vaultId, revision, batchId, deviceId, operation);
+        this.cancelSupersededConflicts(vaultId, deviceId, operation.path, operation.clientChangeId);
         this.db
           .prepare("INSERT INTO accepted_client_changes (device_id, client_change_id, batch_id, vault_revision) VALUES (?, ?, ?, ?)")
           .run(deviceId, operation.clientChangeId, batchId, revision);
@@ -100,7 +121,7 @@ export class SyncService {
         .prepare("UPDATE sync_batches SET status = 'committed', committed_revision = ?, updated_at = ? WHERE id = ?")
         .run(revision, this.now(), batchId);
       eventHub.broadcast({ type: "vault_changed", vault_id: vaultId, latest_revision: revision });
-      return { status: "committed", revision };
+      return { status: "committed", revision, fileRevisions: this.getCommittedFileRevisions(vaultId, operations, revision) };
     });
     return tx();
   }
@@ -205,6 +226,15 @@ export class SyncService {
   }
 
   private createConflict(vaultId: string, batchId: string, deviceId: string, operation: SyncOperation, serverRevisionId: number | null): string {
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM conflicts
+          WHERE vault_id = ? AND device_id = ? AND incoming_client_change_id = ? AND status = 'pending'
+          ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(vaultId, deviceId, operation.clientChangeId) as { id: string } | undefined;
+    if (existing) return existing.id;
+
     const id = nanoid();
     this.db
       .prepare(
@@ -215,6 +245,55 @@ export class SyncService {
       .run(id, vaultId, operation.path, operation.baseRevisionId, serverRevisionId, batchId, operation.clientChangeId, deviceId, this.now());
     eventHub.broadcast({ type: "conflict_created", conflict_id: id, vault_id: vaultId, path: operation.path });
     return id;
+  }
+
+  private getCommittedFileRevisions(
+    vaultId: string,
+    operations: SyncOperation[],
+    committedRevision: number | null
+  ): CommittedFileRevision[] {
+    const findRevision = this.db.prepare(
+      `SELECT fr.id
+         FROM file_revisions fr
+         JOIN files f ON f.id = fr.file_id
+        WHERE fr.vault_id = ? AND f.path = ? AND fr.vault_revision = ?
+        ORDER BY fr.id DESC LIMIT 1`
+    );
+    return operations.map((operation) => {
+      const path = operation.targetPath ?? operation.path;
+      const row = committedRevision === null ? undefined : (findRevision.get(vaultId, path, committedRevision) as { id: number } | undefined);
+      return { path, fileRevisionId: row?.id ?? null };
+    });
+  }
+
+  private cancelSupersededConflicts(vaultId: string, deviceId: string, path: string, acceptedClientChangeId: string): void {
+    const conflicts = this.db
+      .prepare(
+        `SELECT id, incoming_batch_id AS incomingBatchId
+           FROM conflicts
+          WHERE vault_id = ? AND device_id = ? AND file_path = ?
+            AND incoming_client_change_id <> ? AND status = 'pending'`
+      )
+      .all(vaultId, deviceId, path, acceptedClientChangeId) as Array<{ id: string; incomingBatchId: string }>;
+    if (conflicts.length === 0) return;
+
+    const resolvedAt = this.now();
+    const decision = JSON.stringify({ strategy: "superseded_by_accepted_change", acceptedClientChangeId });
+    const resolve = this.db.prepare(
+      "UPDATE conflicts SET status = 'cancelled', decision_json = ?, resolved_at = ? WHERE id = ? AND status = 'pending'"
+    );
+    for (const conflict of conflicts) {
+      resolve.run(decision, resolvedAt, conflict.id);
+      const pending = this.db
+        .prepare("SELECT 1 FROM conflicts WHERE incoming_batch_id = ? AND status = 'pending' LIMIT 1")
+        .get(conflict.incomingBatchId);
+      if (!pending) {
+        this.db
+          .prepare("UPDATE sync_batches SET status = 'aborted', failure_reason = ?, updated_at = ? WHERE id = ? AND status = 'waiting_for_decision'")
+          .run("superseded_by_accepted_change", resolvedAt, conflict.incomingBatchId);
+      }
+      eventHub.broadcast({ type: "conflict_resolved", conflict_id: conflict.id, vault_id: vaultId, status: "cancelled" });
+    }
   }
 
   private getVaultRevision(vaultId: string): number {
