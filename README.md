@@ -1,10 +1,21 @@
 # Private Sync Server
 
+Private Sync Server is a self-hosted backend for synchronizing Obsidian vaults with the Private Sync plugin.
+
+Obsidian plugin: https://github.com/Haniewicz/PrivateSyncPlugin
+
+The server stores the logical state of vaults in SQLite and keeps file contents as blobs on disk. It does not keep a one-to-one browsable Obsidian vault directory. The local vault is reconstructed and updated by the plugin from revisions fetched through the API.
+
+<details>
+<summary>Polski</summary>
+
 Private Sync Server to prywatny backend synchronizacji vaultow Obsidiana dla pluginu Private Sync.
 
 Plugin Obsidiana: https://github.com/Haniewicz/PrivateSyncPlugin
 
 Serwer przechowuje logiczny stan vaultow w SQLite oraz tresc plikow jako bloby na dysku. Nie przechowuje gotowego katalogu vaulta Obsidiana jeden do jednego. Lokalny vault jest odtwarzany i aktualizowany przez plugin na podstawie rewizji pobieranych z API.
+
+</details>
 
 ## Wymagania
 
