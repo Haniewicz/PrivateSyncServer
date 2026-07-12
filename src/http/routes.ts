@@ -137,11 +137,19 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   });
 
   fastify.post("/api/v1/devices/request", async (request, reply) => {
-    const body = deviceRequestSchema.extend({ recoveryPairingCode: z.string().optional() }).parse(request.body);
+    const body = deviceRequestSchema.extend({ recoveryPairingCode: z.string().trim().min(1).optional() }).parse(request.body);
     if (!auth.isConfigured()) return reply.code(409).send({ error: "server_not_configured" });
     if (!auth.verifyPassword(body.password)) return reply.code(401).send({ error: "invalid_password" });
 
-    if (auth.isInitialSetupEnabled() || (body.recoveryPairingCode && auth.consumeRecoveryPairingCode(body.recoveryPairingCode))) {
+    if (auth.isInitialSetupEnabled()) {
+      const device = auth.createTrustedDevice(body.deviceName, body.deviceType);
+      return { status: "approved", ...device };
+    }
+
+    if (body.recoveryPairingCode) {
+      if (!auth.consumeRecoveryPairingCode(body.recoveryPairingCode)) {
+        return reply.code(401).send({ error: "invalid_recovery_pairing_code" });
+      }
       const device = auth.createTrustedDevice(body.deviceName, body.deviceType);
       return { status: "approved", ...device };
     }
