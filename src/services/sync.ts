@@ -34,6 +34,8 @@ type CommitBatchResult = {
   conflicts?: string[];
 };
 
+type ConflictStatus = "resolved" | "cancelled";
+
 export class SyncService {
   private readonly requests: RequestService;
 
@@ -84,14 +86,14 @@ export class SyncService {
       }
 
       this.db.prepare("UPDATE sync_batches SET status = 'validating', updated_at = ? WHERE id = ?").run(this.now(), batchId);
+      const operationsToApply = operations.filter((operation) => !this.isDuplicateChange(deviceId, operation.clientChangeId));
       if (!options.skipDangerousOperationCheck) {
-        const dangerousRequest = this.detectDangerousOperations(vaultId, batchId, deviceId, operations);
+        const dangerousRequest = this.detectDangerousOperations(vaultId, batchId, deviceId, operationsToApply);
         if (dangerousRequest) return dangerousRequest;
       }
 
       const conflicts: string[] = [];
-      for (const operation of operations) {
-        if (this.isDuplicateChange(deviceId, operation.clientChangeId)) continue;
+      for (const operation of operationsToApply) {
         const current = this.getFile(vaultId, operation.path);
         const currentRevision = current?.current_file_revision_id ?? null;
         if (currentRevision !== operation.baseRevisionId) {
@@ -106,9 +108,16 @@ export class SyncService {
         return { status: "conflict", conflicts };
       }
 
+      if (operationsToApply.length === 0) {
+        const revision = this.getVaultRevision(vaultId);
+        this.db
+          .prepare("UPDATE sync_batches SET status = 'committed', committed_revision = ?, updated_at = ? WHERE id = ?")
+          .run(revision, this.now(), batchId);
+        return { status: "committed", revision, fileRevisions: this.getCommittedFileRevisions(vaultId, operations, revision) };
+      }
+
       const revision = this.getVaultRevision(vaultId) + 1;
-      for (const operation of operations) {
-        if (this.isDuplicateChange(deviceId, operation.clientChangeId)) continue;
+      for (const operation of operationsToApply) {
         this.applyOperation(vaultId, revision, batchId, deviceId, operation);
         this.cancelSupersededConflicts(vaultId, deviceId, operation.path, operation.clientChangeId);
         this.db
@@ -259,11 +268,41 @@ export class SyncService {
         WHERE fr.vault_id = ? AND f.path = ? AND fr.vault_revision = ?
         ORDER BY fr.id DESC LIMIT 1`
     );
+    const findCurrentRevision = this.db.prepare(
+      `SELECT current_file_revision_id AS id
+         FROM files
+        WHERE vault_id = ? AND path = ?`
+    );
     return operations.map((operation) => {
       const path = operation.targetPath ?? operation.path;
       const row = committedRevision === null ? undefined : (findRevision.get(vaultId, path, committedRevision) as { id: number } | undefined);
-      return { path, fileRevisionId: row?.id ?? null };
+      const current = row ?? (findCurrentRevision.get(vaultId, path) as { id: number | null } | undefined);
+      return { path, fileRevisionId: current?.id ?? null };
     });
+  }
+
+  resolveConflict(vaultId: string, conflictId: string, status: ConflictStatus, decision: unknown): boolean {
+    const tx = this.db.transaction(() => {
+      const conflict = this.db
+        .prepare("SELECT incoming_batch_id AS incomingBatchId FROM conflicts WHERE id = ? AND vault_id = ? AND status = 'pending'")
+        .get(conflictId, vaultId) as { incomingBatchId: string } | undefined;
+      if (!conflict) return false;
+
+      const resolvedAt = this.now();
+      this.db
+        .prepare("UPDATE conflicts SET status = ?, decision_json = ?, resolved_at = ? WHERE id = ?")
+        .run(status, JSON.stringify(decision ?? {}), resolvedAt, conflictId);
+      const pending = this.db
+        .prepare("SELECT 1 FROM conflicts WHERE incoming_batch_id = ? AND status = 'pending' LIMIT 1")
+        .get(conflict.incomingBatchId);
+      if (!pending) {
+        this.db
+          .prepare("UPDATE sync_batches SET status = 'aborted', failure_reason = ?, updated_at = ? WHERE id = ? AND status = 'waiting_for_decision'")
+          .run(`conflict_${status}`, resolvedAt, conflict.incomingBatchId);
+      }
+      return true;
+    });
+    return tx();
   }
 
   private cancelSupersededConflicts(vaultId: string, deviceId: string, path: string, acceptedClientChangeId: string): void {

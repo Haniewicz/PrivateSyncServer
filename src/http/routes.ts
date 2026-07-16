@@ -294,12 +294,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.post("/api/v1/vaults/:vaultId/conflicts/:conflictId/resolve", async (request, reply) => {
     const params = z.object({ vaultId: z.string(), conflictId: z.string() }).parse(request.params);
     const body = z.object({ status: z.enum(["resolved", "cancelled"]), decision: z.unknown().optional() }).parse(request.body);
-    const result = db
-      .prepare(
-        "UPDATE conflicts SET status = ?, decision_json = ?, resolved_at = ? WHERE id = ? AND vault_id = ? AND status = 'pending'"
-      )
-      .run(body.status, JSON.stringify(body.decision ?? {}), new Date().toISOString(), params.conflictId, params.vaultId);
-    if (result.changes === 0) return reply.code(404).send({ error: "pending_conflict_not_found" });
+    const resolved = sync.resolveConflict(params.vaultId, params.conflictId, body.status, body.decision ?? {});
+    if (!resolved) return reply.code(404).send({ error: "pending_conflict_not_found" });
     eventHub.broadcast({ type: "conflict_resolved", conflict_id: params.conflictId, vault_id: params.vaultId, status: body.status });
     return { ok: true };
   });
